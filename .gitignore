@@ -1,0 +1,9 @@
+/target
+/memory-pack
+/memory-pack-v2
+/memory-pack-v3
+/memory-pack-test
+/memory-pack-nowatch
+/.fastembed_cache
+/.local-run
+/.local-data

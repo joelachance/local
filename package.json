@@ -1,0 +1,10 @@
+{
+  "name": "satori-local-runtime",
+  "private": true,
+  "scripts": {
+    "local:build": "./scripts/local-build.sh",
+    "local:start": "./scripts/local-start.sh",
+    "local:stop": "./scripts/local-stop.sh",
+    "local:status": "./scripts/local-status.sh"
+  }
+}
