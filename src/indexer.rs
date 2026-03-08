@@ -8,7 +8,11 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::embed::provider_from_name;
+use crate::falkor_store::{
+    ChunkGraphPayload, delete_chunks_for_paths, graph_name_from_env, socket_from_env, upsert_chunks,
+};
 use crate::lancedb_store::{ensure_chunk_ids, rebuild_tables};
+use crate::ontology::OntologyEngine;
 use crate::pack::{
     load_file_state, load_index, load_manifest, save_file_state, save_index, save_manifest,
 };
@@ -21,7 +25,9 @@ fn is_text_file(path: &Path) -> bool {
         .map(|s| s.to_ascii_lowercase());
 
     match ext.as_deref() {
-        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "md" | "txt" | "json" | "toml" | "yaml" | "yml")
+        Some(
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "md" | "txt" | "json" | "toml" | "yaml" | "yml",
+        )
         | None => true,
         _ => false,
     }
@@ -37,7 +43,11 @@ fn content_hash(content: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn chunk_text(content: &str, target_chars: usize, overlap_chars: usize) -> Vec<(usize, usize, String)> {
+fn chunk_text(
+    content: &str,
+    target_chars: usize,
+    overlap_chars: usize,
+) -> Vec<(usize, usize, String)> {
     if content.is_empty() {
         return Vec::new();
     }
@@ -86,6 +96,7 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
         .drain(..)
         .map(|s| (s.file_path.clone(), s))
         .collect();
+    let previous_paths: HashSet<String> = state_by_path.keys().cloned().collect();
 
     let mut scanned = 0usize;
     let mut updated_files = 0usize;
@@ -93,6 +104,8 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
     let mut next_docs = Vec::new();
     let mut next_states = Vec::new();
     let mut seen_paths = HashSet::new();
+    let mut updated_paths = HashSet::new();
+    let mut changed_docs = Vec::new();
     let mut provider = provider_from_name(
         &manifest.embedding.provider,
         &manifest.embedding.model,
@@ -104,7 +117,11 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
                 "warning: fastembed init failed ({}), falling back to hash embeddings",
                 e
             );
-            provider_from_name("hash", &manifest.embedding.model, manifest.embedding.dimension)
+            provider_from_name(
+                "hash",
+                &manifest.embedding.model,
+                manifest.embedding.dimension,
+            )
         } else {
             Err(e)
         }
@@ -143,7 +160,10 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
                 .unwrap_or(false);
 
             if unchanged {
-                for doc in existing_by_chunk.values().filter(|d| d.source_path == file_path) {
+                for doc in existing_by_chunk
+                    .values()
+                    .filter(|d| d.source_path == file_path)
+                {
                     next_docs.push(doc.clone());
                     total_chunks += 1;
                 }
@@ -154,6 +174,7 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
             }
 
             updated_files += 1;
+            updated_paths.insert(file_path.clone());
             let chunks = chunk_text(
                 &content,
                 manifest.chunking.target_chars,
@@ -167,7 +188,7 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
             {
                 let chunk_hash = content_hash(&format!("{file_path}:{idx}:{hash}"));
                 let chunk_id = chunk_hash[..16].to_string();
-                next_docs.push(SourceDoc {
+                let doc = SourceDoc {
                     chunk_id,
                     source_path: file_path.clone(),
                     chunk_index: idx,
@@ -177,7 +198,9 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
                     content_hash: hash.clone(),
                     embedding,
                     indexed_at: Utc::now(),
-                });
+                };
+                next_docs.push(doc.clone());
+                changed_docs.push(doc);
                 total_chunks += 1;
             }
 
@@ -197,10 +220,75 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
 
     index = IndexStore { docs: next_docs };
     ensure_chunk_ids(&mut index.docs);
+    ensure_chunk_ids(&mut changed_docs);
     save_index(pack_dir, &index).context("failed to persist index")?;
     rebuild_tables(pack_dir, &index.docs, manifest.embedding.dimension)
         .context("failed to rebuild lancedb tables/indexes")?;
     save_file_state(pack_dir, &next_states).context("failed to persist file state")?;
+
+    let mut ontology = OntologyEngine::new(pack_dir)?;
+    if let Some(socket_path) = socket_from_env() {
+        let graph_name = graph_name_from_env();
+        let deleted_paths: Vec<String> = previous_paths
+            .difference(&seen_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut paths_to_refresh = updated_paths.into_iter().collect::<Vec<_>>();
+        paths_to_refresh.extend(deleted_paths);
+
+        if !paths_to_refresh.is_empty() {
+            if let Err(e) = delete_chunks_for_paths(&socket_path, &graph_name, &paths_to_refresh) {
+                eprintln!("warning: failed deleting stale graph chunks: {e}");
+            }
+        }
+
+        if !changed_docs.is_empty() {
+            let graph_chunks = changed_docs
+                .iter()
+                .map(|doc| {
+                    let extraction = ontology.extract(&doc.content_hash, &doc.content, 12);
+                    ChunkGraphPayload {
+                        chunk_id: doc.chunk_id.clone(),
+                        file_path: doc.source_path.clone(),
+                        chunk_index: doc.chunk_index,
+                        content_hash: doc.content_hash.clone(),
+                        content: doc.content.clone(),
+                        entities: extraction.entities,
+                        relations: extraction.relations,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if let Err(e) = upsert_chunks(&socket_path, &graph_name, &graph_chunks) {
+                eprintln!("warning: failed writing chunks to falkor: {e}");
+            }
+        }
+    }
+
+    let mut source_contents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut source_hashes: HashMap<String, Vec<String>> = HashMap::new();
+    for doc in &index.docs {
+        source_contents
+            .entry(doc.source_path.clone())
+            .or_default()
+            .push(doc.content.clone());
+        source_hashes
+            .entry(doc.source_path.clone())
+            .or_default()
+            .push(doc.content_hash.clone());
+    }
+    for (source_path, contents) in source_contents {
+        let hashes = source_hashes.get(&source_path).cloned().unwrap_or_default();
+        if let Err(e) = ontology.write_artifact(&source_path, &contents, &hashes) {
+            eprintln!(
+                "warning: failed writing ontology artifact for {}: {}",
+                source_path, e
+            );
+        }
+    }
+    if let Err(e) = ontology.save() {
+        eprintln!("warning: failed writing ontology cache: {e}");
+    }
+
     manifest.updated_at = Utc::now();
     save_manifest(pack_dir, manifest).context("failed to update manifest timestamp")?;
 

@@ -1,0 +1,430 @@
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::falkor_store::GraphRelation;
+use crate::ontology_candle::CandleOntologyProvider;
+use crate::ontology_llama::LlamaOntologyProvider;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OntologyEntity {
+    pub name: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OntologyRelation {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OntologyExtraction {
+    pub entities: Vec<String>,
+    pub relations: Vec<GraphRelation>,
+    pub confidence: f32,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OntologyCache {
+    by_content_hash: HashMap<String, OntologyExtraction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OntologyArtifact {
+    pub source_path: String,
+    pub provider: String,
+    pub model: String,
+    pub generated_at: DateTime<Utc>,
+    pub chunk_count: usize,
+    pub entities: Vec<OntologyEntity>,
+    pub relations: Vec<OntologyRelation>,
+}
+
+pub trait OntologyProvider {
+    fn provider_name(&self) -> &'static str;
+    fn model_name(&self) -> String;
+    fn extract(&mut self, content: &str, max_entities: usize) -> Result<OntologyExtraction>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OntologyProviderKind {
+    Llama,
+    Rules,
+    Candle,
+}
+
+impl OntologyProviderKind {
+    fn from_str_value(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "rules" => Self::Rules,
+            "candle" => Self::Candle,
+            _ => Self::Llama,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_str_value(
+            &std::env::var("SATORI_ONTOLOGY_PROVIDER").unwrap_or_else(|_| "llama".to_string()),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OntologyConfig {
+    pub provider: OntologyProviderKind,
+    pub model: String,
+    pub max_tokens: usize,
+    pub timeout_ms: u64,
+}
+
+impl OntologyConfig {
+    pub fn from_env() -> Self {
+        let provider = OntologyProviderKind::from_env();
+        let model = std::env::var("SATORI_ONTOLOGY_MODEL")
+            .unwrap_or_else(|_| "./models/ontology.gguf".to_string());
+        let max_tokens = std::env::var("SATORI_ONTOLOGY_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let timeout_ms = std::env::var("SATORI_ONTOLOGY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20_000);
+        Self {
+            provider,
+            model,
+            max_tokens,
+            timeout_ms,
+        }
+    }
+}
+
+pub struct RuleOntologyProvider;
+
+impl OntologyProvider for RuleOntologyProvider {
+    fn provider_name(&self) -> &'static str {
+        "rules"
+    }
+
+    fn model_name(&self) -> String {
+        "heuristic".to_string()
+    }
+
+    fn extract(&mut self, content: &str, max_entities: usize) -> Result<OntologyExtraction> {
+        let entities = extract_entities(content, max_entities.max(1));
+        let relations = infer_relations(&entities);
+        Ok(OntologyExtraction {
+            entities,
+            relations,
+            confidence: 0.45,
+            provider: "rules".to_string(),
+        })
+    }
+}
+
+pub struct OntologyEngine {
+    pack_dir: PathBuf,
+    cache_path: PathBuf,
+    cache: OntologyCache,
+    provider: Box<dyn OntologyProvider + Send>,
+    config: OntologyConfig,
+}
+
+impl OntologyEngine {
+    pub fn new(pack_dir: &Path) -> Result<Self> {
+        let config = OntologyConfig::from_env();
+        let cache_path = pack_dir.join("state").join("ontology_cache.json");
+        let cache = if cache_path.exists() {
+            let bytes = fs::read(&cache_path).context("failed to read ontology cache")?;
+            serde_json::from_slice::<OntologyCache>(&bytes)
+                .context("failed to parse ontology cache")?
+        } else {
+            OntologyCache::default()
+        };
+        let provider: Box<dyn OntologyProvider + Send> = match config.provider {
+            OntologyProviderKind::Rules => Box::new(RuleOntologyProvider),
+            OntologyProviderKind::Candle => Box::new(CandleOntologyProvider::new(config.clone())),
+            OntologyProviderKind::Llama => match LlamaOntologyProvider::new(config.clone()) {
+                Ok(p) => Box::new(p),
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to initialize llama ontology provider ({}), using rules fallback",
+                        err
+                    );
+                    Box::new(RuleOntologyProvider)
+                }
+            },
+        };
+        Ok(Self {
+            pack_dir: pack_dir.to_path_buf(),
+            cache_path,
+            cache,
+            provider,
+            config,
+        })
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        self.provider.provider_name()
+    }
+
+    pub fn model_name(&self) -> String {
+        self.provider.model_name()
+    }
+
+    pub fn extract(
+        &mut self,
+        content_hash: &str,
+        content: &str,
+        max_entities: usize,
+    ) -> OntologyExtraction {
+        if let Some(existing) = self.cache.by_content_hash.get(content_hash) {
+            return existing.clone();
+        }
+
+        let extraction = self
+            .provider
+            .extract(content, max_entities)
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "warning: ontology extraction failed ({}), using rules fallback",
+                    err
+                );
+                let mut fallback = RuleOntologyProvider;
+                fallback.extract(content, max_entities).unwrap_or_default()
+            });
+        self.cache
+            .by_content_hash
+            .insert(content_hash.to_string(), extraction.clone());
+        extraction
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(parent) = self.cache_path.parent() {
+            fs::create_dir_all(parent).context("failed to create ontology cache dir")?;
+        }
+        let bytes = serde_json::to_vec_pretty(&self.cache)?;
+        fs::write(&self.cache_path, bytes).context("failed to write ontology cache")?;
+        Ok(())
+    }
+
+    pub fn artifact_path_for_source(&self, source_path: &str) -> PathBuf {
+        let mut h = Sha256::new();
+        h.update(source_path.as_bytes());
+        let source_hash = format!("{:x}", h.finalize());
+        self.pack_dir
+            .join("ontology")
+            .join(format!("{}.ontology.json", &source_hash[..16]))
+    }
+
+    pub fn write_artifact(
+        &mut self,
+        source_path: &str,
+        chunk_contents: &[String],
+        chunk_hashes: &[String],
+    ) -> Result<PathBuf> {
+        let mut entity_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut relation_counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+
+        for (idx, content) in chunk_contents.iter().enumerate() {
+            let extraction = if let Some(hash) = chunk_hashes.get(idx) {
+                if let Some(cached) = self.cache.by_content_hash.get(hash) {
+                    cached.clone()
+                } else {
+                    self.extract(hash, content, 12)
+                }
+            } else {
+                OntologyExtraction {
+                    entities: extract_entities(content, 12),
+                    relations: infer_relations(&extract_entities(content, 12)),
+                    confidence: 0.4,
+                    provider: "rules".to_string(),
+                }
+            };
+            for e in extraction.entities {
+                *entity_counts.entry(e).or_insert(0) += 1;
+            }
+            for rel in extraction.relations {
+                *relation_counts
+                    .entry((rel.source, rel.relation, rel.target))
+                    .or_insert(0) += 1;
+            }
+        }
+
+        let entities = entity_counts
+            .into_iter()
+            .map(|(name, count)| OntologyEntity { name, count })
+            .collect::<Vec<_>>();
+        let relations = relation_counts
+            .into_iter()
+            .map(|((source, relation, target), count)| OntologyRelation {
+                source,
+                relation,
+                target,
+                count,
+            })
+            .collect::<Vec<_>>();
+
+        let artifact = OntologyArtifact {
+            source_path: source_path.to_string(),
+            provider: self.provider_name().to_string(),
+            model: self.model_name(),
+            generated_at: Utc::now(),
+            chunk_count: chunk_contents.len(),
+            entities,
+            relations,
+        };
+        let artifact_path = self.artifact_path_for_source(source_path);
+        if let Some(parent) = artifact_path.parent() {
+            fs::create_dir_all(parent).context("failed to create ontology artifact dir")?;
+        }
+        fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact)?)
+            .context("failed to write ontology artifact")?;
+        Ok(artifact_path)
+    }
+
+    pub fn list_artifacts(pack_dir: &Path) -> Result<Vec<PathBuf>> {
+        let dir = pack_dir.join("ontology");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(dir).context("failed reading ontology directory")? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                out.push(path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    pub fn read_artifact(path: &Path) -> Result<OntologyArtifact> {
+        let bytes = fs::read(path).context("failed to read ontology artifact")?;
+        serde_json::from_slice::<OntologyArtifact>(&bytes).context("invalid ontology artifact")
+    }
+
+    pub fn find_artifact_for_source(pack_dir: &Path, source_path: &str) -> Result<Option<PathBuf>> {
+        let mut h = Sha256::new();
+        h.update(source_path.as_bytes());
+        let source_hash = format!("{:x}", h.finalize());
+        let path = pack_dir
+            .join("ontology")
+            .join(format!("{}.ontology.json", &source_hash[..16]));
+        if path.exists() {
+            Ok(Some(path))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn config(&self) -> &OntologyConfig {
+        &self.config
+    }
+}
+
+fn extract_entities(content: &str, max_entities: usize) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "that", "with", "this", "from", "into", "while", "where", "when",
+        "then", "have", "has", "had", "will", "would", "could", "should", "using", "use", "used",
+        "into", "about", "your", "you", "they", "their", "there", "were", "been", "are", "was",
+        "but", "not", "its", "our", "out", "all", "any", "can", "may", "per", "via", "api", "json",
+    ];
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for token in content
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .map(str::trim)
+        .filter(|t| t.len() >= 3)
+    {
+        let lower = token.to_ascii_lowercase();
+        if STOPWORDS.contains(&lower.as_str()) || lower.chars().all(|c| c.is_numeric()) {
+            continue;
+        }
+        *counts.entry(lower).or_insert(0) += 1;
+    }
+
+    let mut scored = counts.into_iter().collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            let al = a.0.len();
+            let bl = b.0.len();
+            bl.cmp(&al)
+        })
+    });
+
+    scored
+        .into_iter()
+        .take(max_entities)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn infer_relations(entities: &[String]) -> Vec<GraphRelation> {
+    let mut relations = Vec::new();
+    for pair in entities.windows(2).take(12) {
+        relations.push(GraphRelation {
+            source: pair[0].clone(),
+            relation: "related_to".to_string(),
+            target: pair[1].clone(),
+        });
+    }
+    relations
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{OntologyEngine, OntologyProviderKind};
+
+    #[test]
+    fn parses_provider_kind() {
+        assert_eq!(
+            OntologyProviderKind::from_str_value("llama"),
+            OntologyProviderKind::Llama
+        );
+        assert_eq!(
+            OntologyProviderKind::from_str_value("rules"),
+            OntologyProviderKind::Rules
+        );
+        assert_eq!(
+            OntologyProviderKind::from_str_value("candle"),
+            OntologyProviderKind::Candle
+        );
+    }
+
+    #[test]
+    fn writes_artifact_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        let pack_dir = PathBuf::from(format!("/tmp/satori-ontology-test-{}", nonce));
+        fs::create_dir_all(pack_dir.join("state")).expect("state dir should exist");
+
+        let mut engine = OntologyEngine::new(&pack_dir).expect("engine should initialize");
+        let out = engine
+            .write_artifact(
+                "/tmp/demo-source",
+                &["Rust uses LanceDB".to_string()],
+                &["hash1".to_string()],
+            )
+            .expect("artifact should be written");
+        assert!(out.exists());
+
+        let _ = fs::remove_dir_all(pack_dir);
+    }
+}

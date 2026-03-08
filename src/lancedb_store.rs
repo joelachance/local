@@ -6,14 +6,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
-use arrow_array::{
-    Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
-};
+use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures_util::TryStreamExt;
+use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lance_index::scalar::FullTextSearchQuery;
 use sha2::{Digest, Sha256};
 
 use crate::types::{QueryHit, SourceDoc};
@@ -73,11 +71,11 @@ pub fn rebuild_tables(pack_dir: &Path, docs: &[SourceDoc], embedding_dim: usize)
         let chunk_id = StringArray::from_iter_values(docs.iter().map(|d| d.chunk_id.clone()));
         let source_path = StringArray::from_iter_values(docs.iter().map(|d| d.source_path.clone()));
         let chunk_index = UInt32Array::from_iter_values(docs.iter().map(|d| d.chunk_index as u32));
-        let start_offset =
-            Int64Array::from_iter_values(docs.iter().map(|d| d.start_offset as i64));
+        let start_offset = Int64Array::from_iter_values(docs.iter().map(|d| d.start_offset as i64));
         let end_offset = Int64Array::from_iter_values(docs.iter().map(|d| d.end_offset as i64));
         let content = StringArray::from_iter_values(docs.iter().map(|d| d.content.clone()));
-        let content_hash = StringArray::from_iter_values(docs.iter().map(|d| d.content_hash.clone()));
+        let content_hash =
+            StringArray::from_iter_values(docs.iter().map(|d| d.content_hash.clone()));
         let embedding = arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             docs.iter()
                 .map(|d| Some(d.embedding.iter().copied().map(Some).collect::<Vec<_>>())),
@@ -128,7 +126,11 @@ pub fn rebuild_tables(pack_dir: &Path, docs: &[SourceDoc], embedding_dim: usize)
     Ok(())
 }
 
-fn parse_hits_from_batches(batches: &[RecordBatch], score: f32) -> Result<Vec<QueryHit>> {
+fn parse_hits_from_batches(
+    batches: &[RecordBatch],
+    score: f32,
+    source_name: &str,
+) -> Result<Vec<QueryHit>> {
     let mut hits = Vec::new();
     for batch in batches {
         let chunk_col = batch
@@ -147,6 +149,14 @@ fn parse_hits_from_batches(batches: &[RecordBatch], score: f32) -> Result<Vec<Qu
             .column_by_name("chunk_index")
             .ok_or_else(|| anyhow!("missing chunk_index column"))?
             .as_primitive::<arrow_array::types::UInt32Type>();
+        let start_col = batch
+            .column_by_name("start_offset")
+            .ok_or_else(|| anyhow!("missing start_offset column"))?
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let end_col = batch
+            .column_by_name("end_offset")
+            .ok_or_else(|| anyhow!("missing end_offset column"))?
+            .as_primitive::<arrow_array::types::Int64Type>();
         for i in 0..batch.num_rows() {
             hits.push(QueryHit {
                 score,
@@ -154,13 +164,22 @@ fn parse_hits_from_batches(batches: &[RecordBatch], score: f32) -> Result<Vec<Qu
                 chunk_id: chunk_col.value(i).to_string(),
                 chunk_index: idx_col.value(i) as usize,
                 content: content_col.value(i).to_string(),
+                start_offset: Some(start_col.value(i) as usize),
+                end_offset: Some(end_col.value(i) as usize),
+                source: source_name.to_string(),
+                group_key: Some(path_col.value(i).to_string()),
             });
         }
     }
     Ok(hits)
 }
 
-pub fn hybrid_query(pack_dir: &Path, query: &str, query_embedding: &[f32], top_k: usize) -> Result<Vec<QueryHit>> {
+pub fn hybrid_query(
+    pack_dir: &Path,
+    query: &str,
+    query_embedding: &[f32],
+    top_k: usize,
+) -> Result<Vec<QueryHit>> {
     let db_path = db_dir(pack_dir);
     if !db_path.exists() {
         return Ok(Vec::new());
@@ -188,6 +207,8 @@ pub fn hybrid_query(pack_dir: &Path, query: &str, query_embedding: &[f32], top_k
                 "source_path".to_string(),
                 "chunk_index".to_string(),
                 "content".to_string(),
+                "start_offset".to_string(),
+                "end_offset".to_string(),
             ]))
             .limit(top_k * 4)
             .execute()
@@ -203,6 +224,8 @@ pub fn hybrid_query(pack_dir: &Path, query: &str, query_embedding: &[f32], top_k
                 "source_path".to_string(),
                 "chunk_index".to_string(),
                 "content".to_string(),
+                "start_offset".to_string(),
+                "end_offset".to_string(),
             ]))
             .limit(top_k * 4)
             .execute()
@@ -221,8 +244,8 @@ pub fn hybrid_query(pack_dir: &Path, query: &str, query_embedding: &[f32], top_k
         rt.block_on(task)?
     };
 
-    let vec_list = parse_hits_from_batches(&vec_hits, 0.0)?;
-    let fts_list = parse_hits_from_batches(&fts_hits, 0.0)?;
+    let vec_list = parse_hits_from_batches(&vec_hits, 0.0, "lancedb_vector")?;
+    let fts_list = parse_hits_from_batches(&fts_hits, 0.0, "lancedb_fts")?;
 
     // Reciprocal rank fusion over two ranked lists.
     let mut by_id: HashMap<String, QueryHit> = HashMap::new();

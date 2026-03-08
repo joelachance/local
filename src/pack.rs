@@ -63,8 +63,11 @@ pub fn init_pack(
     fs::write(manifest_path(pack_dir), manifest_json).context("failed to write manifest.json")?;
 
     if !index_path(pack_dir).exists() || force {
-        fs::write(index_path(pack_dir), serde_json::to_string_pretty(&IndexStore::default())?)
-            .context("failed to write index.json")?;
+        fs::write(
+            index_path(pack_dir),
+            serde_json::to_string_pretty(&IndexStore::default())?,
+        )
+        .context("failed to write index.json")?;
     }
     if !state_path(pack_dir).exists() || force {
         fs::write(state_path(pack_dir), b"[]").context("failed to write state/file_state.json")?;
@@ -82,8 +85,11 @@ pub fn load_manifest(pack_dir: &Path) -> Result<Manifest> {
 
 pub fn save_manifest(pack_dir: &Path, mut manifest: Manifest) -> Result<()> {
     manifest.updated_at = Utc::now();
-    fs::write(manifest_path(pack_dir), serde_json::to_vec_pretty(&manifest)?)
-        .context("failed writing manifest.json")?;
+    fs::write(
+        manifest_path(pack_dir),
+        serde_json::to_vec_pretty(&manifest)?,
+    )
+    .context("failed writing manifest.json")?;
     Ok(())
 }
 

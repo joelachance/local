@@ -68,10 +68,41 @@ pub struct QueryHit {
     pub chunk_id: String,
     pub chunk_index: usize,
     pub content: String,
+    #[serde(default)]
+    pub start_offset: Option<usize>,
+    #[serde(default)]
+    pub end_offset: Option<usize>,
+    #[serde(default = "default_query_source")]
+    pub source: String,
+    #[serde(default)]
+    pub group_key: Option<String>,
+}
+
+fn default_query_source() -> String {
+    "lancedb".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueryTimings {
+    pub embed: u128,
+    pub retrieval: u128,
+    pub rerank: u128,
+    pub total: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub results: Vec<QueryHit>,
     pub mode: String,
+    #[serde(default)]
+    pub grouped_results: Vec<QueryGroup>,
+    #[serde(default)]
+    pub timings_ms: QueryTimings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueryGroup {
+    pub group_key: String,
+    pub score: f32,
+    pub hits: Vec<QueryHit>,
 }

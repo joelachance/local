@@ -24,7 +24,6 @@ impl EmbeddingProvider for HashEmbeddingProvider {
     fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
         Ok(hash_embed(query, self.dim))
     }
-
 }
 
 pub struct FastEmbedProvider {
@@ -62,10 +61,13 @@ impl EmbeddingProvider for FastEmbedProvider {
         out.pop()
             .ok_or_else(|| anyhow!("no embedding generated for query"))
     }
-
 }
 
-pub fn provider_from_name(provider: &str, model: &str, dim: usize) -> Result<Box<dyn EmbeddingProvider>> {
+pub fn provider_from_name(
+    provider: &str,
+    model: &str,
+    dim: usize,
+) -> Result<Box<dyn EmbeddingProvider>> {
     match provider {
         "fastembed" => Ok(Box::new(FastEmbedProvider::try_new(model)?)),
         "hash" => Ok(Box::new(HashEmbeddingProvider::new(dim))),
