@@ -14,10 +14,20 @@ AUTH_SECRET=dev-secret bun run local:start
 bun run local:status
 ```
 
+Equivalent daemon aliases:
+
+```bash
+bun run daemon:start
+bun run daemon:status
+bun run daemon:stop
+```
+
 This starts:
 
-- FalkorDB over Unix socket (`FALKORDB_SOCKET`, default `/tmp/falkordb.sock`)
-- Rust API daemon (`target/release/satori serve ...`) on `API_PORT` (default `4242`)
+- FalkorDB sidecar over Unix socket (`FALKORDB_SOCKET`, default `/tmp/falkordb.sock`)
+- Rust API daemon (`target/release/satori --headless-serve ...`) on `API_PORT` (default `4242`)
+
+On first run, FalkorDB sidecar artifacts are downloaded and verified into `./.local-runtime/falkor/`.
 
 Stop services:
 
@@ -44,41 +54,95 @@ curl -s http://127.0.0.1:4242/health
 ### Shared environment contract
 
 - `FALKORDB_SOCKET` (default `/tmp/falkordb.sock`)
+- `FALKOR_GRAPH` (default `satori`)
 - `LANCEDB_PATH` (default local: `./.local-data/lance`, docker: `/data/lance`)
-- `API_PORT` (default `4242` for runtime scripts; CLI `serve` still defaults to `7821` when called directly)
+- `API_PORT` (default `4242` for runtime scripts; `--headless-serve` still defaults to `7821` when called directly)
 - `AUTH_SECRET` (recommended; used as required runtime secret contract)
+- `SATORI_ONTOLOGY_PROVIDER` (`llama` default; `rules` or `candle` optional)
+- `SATORI_ONTOLOGY_MODEL` (GGUF model path for llama provider)
+- `SATORI_ONTOLOGY_MAX_TOKENS` (default `512`)
+- `SATORI_ONTOLOGY_TIMEOUT_MS` (default `20000`)
 
-## Quick start
+To enable true in-process `llama.cpp` inference via Rust bindings, build with:
 
 ```bash
-cargo run -- init --pack ./memory-pack --provider fastembed --model BAAI/bge-small-en-v1.5 --dim 384
-cargo run -- index --pack ./memory-pack --source ./specs
-cargo run -- serve --pack ./memory-pack --port 7821
+cargo build --features llama-embedded
+```
+
+Notes:
+- `llama-embedded` requires local build tooling (`cmake` + C/C++ toolchain).
+- Without this feature, the `llama` provider falls back to local `llama-cli` if present.
+
+Sidecar details:
+
+- `FALKOR_RUNTIME_ROOT` (optional, defaults to `./.local-runtime/falkor`)
+- Artifacts are checksum-verified before extraction.
+- Current native sidecar support: `darwin-arm64`, `linux-x86_64`.
+
+## Quick start (command-first)
+
+```bash
+bun run local:build
+bun run local:start
+./target/release/satori sources add ./specs
+./target/release/satori jobs list
+./target/release/satori index
+./target/release/satori jobs list
+./target/release/satori query "local memory pack"
+./target/release/satori status
+./target/release/satori ontology list
+./target/release/satori ontology show --source ./specs
+./target/release/satori ontology export --source ./specs --out ./specs-ontology.json
 ```
 
 In another terminal:
 
 ```bash
-curl -s http://127.0.0.1:7821/health
-curl -s -X POST http://127.0.0.1:7821/query -H "content-type: application/json" -d '{"query":"local memory pack","mode":"hybrid","top_k":5}'
-curl -s -X POST http://127.0.0.1:7821/index -H "content-type: application/json" -d '{}'
+curl -s http://127.0.0.1:4242/health
+curl -s -X POST http://127.0.0.1:4242/query -H "content-type: application/json" -d '{"query":"local memory pack","mode":"hybrid","top_k":5}'
+curl -s -X POST http://127.0.0.1:4242/index -H "content-type: application/json" -d '{}'
+curl -s http://127.0.0.1:4242/graph/schema
+curl -s -X POST http://127.0.0.1:4242/graph/subgraph -H "content-type: application/json" -d '{"query":"memory pack","depth":2,"limit":25}'
+curl -s http://127.0.0.1:4242/ontology/sources
+curl -s --get http://127.0.0.1:4242/ontology/source --data-urlencode "path=./specs"
 ```
 
-## Implemented commands
+## Spec status
 
-- `satori init --pack <path> [--provider hash|fastembed] [--model <model>] [--dim <n>]`
-- `satori index --pack <path> --source <path>...`
-- `satori query "<query>" --pack <path> [--mode vector|hybrid] [--top-k N] [--json]`
-- `satori serve --pack <path> [--host 127.0.0.1] [--port 7821]`
-- `satori status --pack <path>`
+- Current target contract is command-first (`specs/cli-v1.md` V1.1).
+- TUI is not part of the required runtime surface.
+- Background ingestion is defined as watch lifecycle (`watch start`/`watch stop`) in spec.
+- Cloud sync/push is deferred and only extension points are in scope.
+
+## Command contract (V1.1 target)
+
+- `satori status`
+- `satori query "<query>" [--mode vector|hybrid] [--top-k N]`
+- `satori index`
+- `satori sources list`
+- `satori sources add <path>`
+- `satori sources remove <path>`
+- `satori jobs list`
+- `satori jobs status <job-id>`
+- `satori --headless-serve --pack <path> [--host 127.0.0.1] [--port 7821]`
 
 ## Notes
 
 - Storage is persisted in LanceDB files under `<pack>/lancedb/` (for example `chunks.lance`).
-- Current retrieval is true hybrid: vector search + LanceDB FTS search with RRF fusion.
+- Indexing writes to both LanceDB and Falkor graph (when `FALKORDB_SOCKET` is available).
+- `POST /index` and `sources add` enqueue background indexing jobs and return immediately with `job` metadata.
+- Use `satori jobs list` / `satori jobs status <job-id>` (or `GET /jobs`) to monitor long-running ingestion.
+- Query retrieval fans out to LanceDB and Falkor in parallel, then applies grouped rerank.
+- Ontology extraction is local and embedded (no separate Ollama runtime required); cache is stored at `<pack>/state/ontology_cache.json`.
+- Per-source ontology artifacts are emitted under `<pack>/ontology/*.ontology.json`.
+- `llama` provider is selected by default and falls back to `rules` if unavailable.
 - `fastembed` is implemented for ONNX-based local embeddings.
 - Default init now uses `fastembed`; if model init fails, runtime falls back to `hash`.
 - `serve` performs a single startup index pass using manifest sources, then serves a static snapshot.
+- Graph inspection endpoints:
+  - `GET /graph/schema`
+  - `POST /graph/subgraph`
+  - `GET /graph/view` (simple browser visualization)
 - `/mcp` endpoint implements a minimal MCP JSON-RPC tool surface:
   - `memory_query`
   - `memory_status`

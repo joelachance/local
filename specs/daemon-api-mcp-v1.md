@@ -1,10 +1,13 @@
-# Daemon API and MCP Contract V1
+# Daemon API and MCP Contract V1.1
+
+This document aligns daemon behavior with the command-first runtime contract and explicit watch lifecycle management.
 
 ## Runtime
 
 - Local daemon default bind: `127.0.0.1:7821`
 - Transport: HTTP JSON for local API.
 - MCP adapter exposed by daemon process (stdio or local HTTP bridge, implementation choice).
+- TUI is not a required runtime surface.
 
 ## Local HTTP API
 
@@ -25,6 +28,19 @@ Response:
 ### `GET /status`
 
 Returns active pack, indexing state, and watcher state.
+
+Response fields must include:
+
+- `pack_path`
+- `watch` object with:
+  - `enabled` (bool)
+  - `state` (`stopped|starting|running|stopping|error`)
+  - `last_event_at` (nullable timestamp)
+  - `last_index_at` (nullable timestamp)
+  - `last_error` (nullable string)
+- `index_freshness` object with:
+  - `last_full_index_at`
+  - `pending_changes` (count)
 
 ### `POST /query`
 
@@ -69,17 +85,55 @@ Response:
 
 ### `POST /index`
 
-Triggers index run for configured sources.
+Enqueues background index run for configured sources.
+
+Response:
+
+```json
+{
+  "status": "accepted",
+  "job": {
+    "id": "job-12",
+    "job_type": "index_sources",
+    "state": "queued"
+  }
+}
+```
+
+### `GET /jobs`
+
+Lists recent background jobs.
+
+### `GET /jobs/:id`
+
+Returns status of a specific background job.
 
 ### `POST /watch/start`
 
 Starts incremental watch mode.
 
+Request:
+
+```json
+{
+  "pack": "./memory-pack",
+  "debounce_ms": 500
+}
+```
+
 ### `POST /watch/stop`
 
 Stops watch mode.
 
-## MCP Tools (V1)
+Request:
+
+```json
+{
+  "pack": "./memory-pack"
+}
+```
+
+## MCP Tools (V1.1)
 
 ### `memory_query`
 
@@ -97,7 +151,7 @@ Output:
 
 ### `memory_status`
 
-Returns daemon status, pack metadata, and index freshness.
+Returns daemon status, pack metadata, index freshness, and watch lifecycle state.
 
 ### `memory_sources`
 
@@ -122,6 +176,10 @@ Lists configured source roots and watch/index status.
   - `PACK_INVALID`
   - `INDEX_IN_PROGRESS`
   - `INDEX_FAILED`
+  - `JOB_NOT_FOUND`
+  - `WATCH_ALREADY_RUNNING`
+  - `WATCH_NOT_RUNNING`
+  - `WATCH_FAILED`
   - `EMBEDDING_FAILED`
   - `QUERY_INVALID`
   - `INTERNAL_ERROR`

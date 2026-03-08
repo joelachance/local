@@ -1,13 +1,17 @@
-# CLI Specification V1
+# CLI Specification V1.1 (Command-First)
+
+This document supersedes earlier CLI guidance that treated non-command interfaces as primary.
 
 ## Binary
 
 - Command: `satori`
-- Config root default: `~/.satori/`
+- Primary interface: command-only CLI
+- Optional UIs are non-normative and must not replace command contracts
+- Local runtime scripts must auto-provision native Falkor sidecar artifacts (no manual Falkor install required)
 
-## Commands
+## Required Commands
 
-## `satori init`
+### `satori init`
 
 Creates a new memory pack scaffold in target directory.
 
@@ -20,46 +24,94 @@ satori init --pack ./memory-pack
 Flags:
 
 - `--pack <path>` required
+- `--provider <hash|fastembed>` optional (default `fastembed`)
 - `--model <id>` optional (default `BAAI/bge-small-en-v1.5`)
+- `--dim <n>` optional (default `384`)
 - `--force` optional overwrite scaffold
 
-## `satori index`
+### `satori index`
 
-Indexes source files into pack.
+Enqueues indexing for configured sources and returns a job id.
 
 Usage:
 
 ```bash
-satori index --pack ./memory-pack --source ./project
+satori index
+```
+
+Flags: none (uses daemon-configured pack and sources).
+
+### `satori sources add`
+
+Adds a source path and enqueues background indexing.
+
+Usage:
+
+```bash
+satori sources add ./project
+satori sources add ./README.md
+```
+
+Rules:
+
+- `<path>` may be a directory or a single file.
+- Ingestion discovery is recursive through a unified traversal path.
+- If `<path>` is a file, traversal yields that file only.
+
+### `satori jobs list`
+
+Lists recent background ingestion/index jobs.
+
+### `satori jobs status <job-id>`
+
+Returns detailed state for a single job.
+
+### `satori serve`
+
+Starts daemon + MCP adapter for the selected pack.
+
+Usage:
+
+```bash
+satori serve --pack ./memory-pack --host 127.0.0.1 --port 7821
 ```
 
 Flags:
 
 - `--pack <path>` required
-- `--source <path>` repeatable
-- `--include <glob>` repeatable
-- `--exclude <glob>` repeatable
-- `--watch` optional enable watch mode after initial index
-- `--max-workers <n>` optional
+- `--host <host>` optional, default `127.0.0.1`
+- `--port <port>` optional, default `7821`
 
-## `satori serve`
+### `satori watch start`
 
-Starts daemon and MCP adapter.
+Starts background watch mode for incremental ingestion.
 
 Usage:
 
 ```bash
-satori serve --pack ./memory-pack --port 7821
+satori watch start --pack ./memory-pack --debounce-ms 500
 ```
 
 Flags:
 
 - `--pack <path>` required
-- `--host <host>` default `127.0.0.1`
-- `--port <port>` default `7821`
-- `--no-watch` optional
+- `--debounce-ms <n>` optional
 
-## `satori query`
+### `satori watch stop`
+
+Stops the watch job for a pack.
+
+Usage:
+
+```bash
+satori watch stop --pack ./memory-pack
+```
+
+Flags:
+
+- `--pack <path>` required
+
+### `satori query`
 
 Runs local query against pack (debug and scripting).
 
@@ -73,19 +125,24 @@ Flags:
 
 - positional query string required
 - `--pack <path>` required
-- `--mode <vector|hybrid>` default `hybrid`
-- `--top-k <n>` default `8`
-- `--json` output machine-readable JSON
+- `--mode <vector|hybrid>` optional, default `hybrid`
+- `--top-k <n>` optional, default `8`
+- `--json` optional machine-readable output
 
-## `satori status`
+### `satori status`
 
-Displays pack health, index freshness, and watcher status.
+Displays pack health, daemon state, and watch freshness.
 
 Usage:
 
 ```bash
-satori status --pack ./memory-pack
+satori status --pack ./memory-pack --json
 ```
+
+Flags:
+
+- `--pack <path>` required
+- `--json` optional machine-readable output
 
 ## Output Rules
 
@@ -101,6 +158,8 @@ satori status --pack ./memory-pack
 - `3` pack/config validation failure
 - `4` indexing failure
 - `5` query failure
+- `6` watch lifecycle failure
+- `7` background job failure
 
 ## Error Message Rules
 

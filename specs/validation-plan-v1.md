@@ -1,8 +1,8 @@
-# Validation Plan V1
+# Validation Plan V1.1
 
 ## Purpose
 
-Define the mandatory validation steps before and during implementation for V1.
+Define the mandatory validation steps before and during implementation for V1.1.
 
 ## Test Dataset Profiles
 
@@ -74,6 +74,14 @@ Gate passes only if all PRD thresholds are met.
 5. Execute fixed query suite.
 6. Verify returned citations and ranking determinism.
 
+## Watch Lifecycle Validation
+
+1. Start watch using command/API contract.
+2. Edit/add/delete files in indexed sources.
+3. Verify incremental ingestion completes within target budget.
+4. Verify `/status` and `memory_status` expose correct watch state and freshness.
+5. Stop watch and verify no background ingestion occurs afterward.
+
 ## Portability Validation
 
 1. Build pack on machine A.
@@ -90,3 +98,4 @@ Gate passes only if all PRD thresholds are met.
 - LanceDB decision protocol agreed.
 - Baseline MacBook targets agreed.
 - Validation dataset and scripts defined.
+- Command-first and no-TUI runtime contract documented and accepted.

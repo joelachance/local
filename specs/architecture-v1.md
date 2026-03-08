@@ -1,22 +1,25 @@
-# Architecture V1: Local Memory Pack
+# Architecture V1.1: Local Memory Pack (Command-First)
 
 ## System Overview
 
-V1 is a local-first Rust system with three runtime surfaces:
+V1.1 is a local-first Rust system with three runtime surfaces:
 
-- CLI for setup, indexing, serving, and diagnostics.
+- Command-first CLI for setup, indexing, serving, watch lifecycle, and diagnostics.
 - Daemon for query and watch workflows.
 - MCP adapter for AI client integration.
+- TUI is optional and non-normative.
+- FalkorDB runs as a managed native sidecar provisioned by local runtime scripts.
 
 ## Component Diagram
 
 ```mermaid
 flowchart LR
-  cli[SatoriCLI] --> orchestrator[IndexOrchestrator]
+  cli[SatoriCLI_Commands] --> orchestrator[IndexOrchestrator]
   orchestrator --> parser[ParserChunker]
   parser --> embedder[EmbeddingProvider]
   embedder --> store[LanceDBStore]
-  watcher[FileWatcher] --> orchestrator
+  cliWatch[SatoriWatchCommands] --> daemon[SatoriDaemon]
+  watcher[FileWatcherJob] --> orchestrator
   daemon[SatoriDaemon] --> retriever[HybridRetriever]
   retriever --> store
   mcp[MCPAdapter] --> daemon
@@ -39,6 +42,7 @@ flowchart LR
 4. Embed only new/changed chunks.
 5. Upsert rows into `chunks` table and refresh indexes as required.
 6. Persist file state checkpoint.
+7. Watch lifecycle is controlled by explicit start/stop commands and reflected in daemon status.
 
 ## Core Dependencies
 
@@ -72,7 +76,7 @@ If not passed, fallback is `sqlite-vec` + separate keyword index while preservin
 
 ### Local
 
-- Single daemon process on user machine.
+- Single daemon process on user machine plus managed Falkor sidecar process.
 - Local filesystem pack + local model cache.
 
 ### Cloud/Server
@@ -85,4 +89,4 @@ If not passed, fallback is `sqlite-vec` + separate keyword index while preservin
 
 - Structured logs for ingest/query/watch.
 - Timing spans for embed, retrieval, rerank, and total.
-- Health and status endpoints expose freshness and failure state.
+- Health and status endpoints expose freshness, watcher lifecycle state, and failure state.
