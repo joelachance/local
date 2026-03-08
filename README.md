@@ -91,8 +91,8 @@ bun run local:start
 ./target/release/satori query "local memory pack"
 ./target/release/satori status
 ./target/release/satori ontology list
-./target/release/satori ontology show --source ./specs
-./target/release/satori ontology export --source ./specs --out ./specs-ontology.json
+./target/release/satori ontology show --source /absolute/path/to/specs/prd-v1-local-memory.md
+./target/release/satori ontology export --source /absolute/path/to/specs/prd-v1-local-memory.md --out ./specs-ontology.json
 ```
 
 In another terminal:
@@ -106,6 +106,8 @@ curl -s -X POST http://127.0.0.1:4242/graph/subgraph -H "content-type: applicati
 curl -s http://127.0.0.1:4242/ontology/sources
 curl -s --get http://127.0.0.1:4242/ontology/source --data-urlencode "path=./specs"
 ```
+
+If you query a directory or unknown path with `/ontology/source`, the response now includes `error.suggestions[]` with valid file-level `source_path` values you can use directly.
 
 ## Spec status
 
@@ -135,6 +137,8 @@ curl -s --get http://127.0.0.1:4242/ontology/source --data-urlencode "path=./spe
 - Query retrieval fans out to LanceDB and Falkor in parallel, then applies grouped rerank.
 - Ontology extraction is local and embedded (no separate Ollama runtime required); cache is stored at `<pack>/state/ontology_cache.json`.
 - Per-source ontology artifacts are emitted under `<pack>/ontology/*.ontology.json`.
+- `GET /ontology/source` expects a file-level source path; for directories or unknown paths it returns suggestions instead of a bare not-found.
+- `satori ontology show --source <path>` prints suggestions with follow-up commands when no exact source artifact exists.
 - `llama` provider is selected by default and falls back to `rules` if unavailable.
 - `fastembed` is implemented for ONNX-based local embeddings.
 - Default init now uses `fastembed`; if model init fails, runtime falls back to `hash`.
