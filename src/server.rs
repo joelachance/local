@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,8 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::falkor_store::{
-    graph_name_from_env, graph_schema as falkor_graph_schema,
-    graph_subgraph as falkor_graph_subgraph,
+    graph_name_from_env, graph_schema as falkor_graph_schema, graph_subgraph as falkor_graph_subgraph,
 };
 use crate::indexer::run_index;
 use crate::ontology::OntologyEngine;
@@ -167,10 +166,7 @@ pub async fn run_server(
         .route("/index", post(index_now))
         .route("/jobs", get(jobs_list))
         .route("/jobs/{id}", get(job_status))
-        .route(
-            "/sources",
-            get(sources_list).post(sources_add).delete(sources_remove),
-        )
+        .route("/sources", get(sources_list).post(sources_add).delete(sources_remove))
         .route("/ontology/sources", get(ontology_sources))
         .route("/ontology/source", get(ontology_source))
         .route("/mcp", post(mcp))
@@ -217,7 +213,10 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
     let manifest = load_manifest(&state.pack).ok();
     let (active_job, last_job, queued_jobs) = {
         let jobs = state.jobs.lock().await;
-        let active = jobs.running.as_ref().and_then(|id| jobs.find(id).cloned());
+        let active = jobs
+            .running
+            .as_ref()
+            .and_then(|id| jobs.find(id).cloned());
         let last = jobs
             .jobs
             .iter()
@@ -388,9 +387,7 @@ fn normalize_source_path(path: &str) -> Result<String, (StatusCode, Json<Value>)
     if !meta.is_dir() && !meta.is_file() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(
-                json!({"error":{"code":"SOURCE_INVALID","message":"source must be a file or directory"}}),
-            ),
+            Json(json!({"error":{"code":"SOURCE_INVALID","message":"source must be a file or directory"}})),
         ));
     }
     let normalized = p.canonicalize().map_err(|e| {
@@ -409,9 +406,7 @@ fn canonicalize_if_exists(path: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
-async fn sources_list(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn sources_list(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let manifest = load_manifest(&state.pack).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -593,11 +588,7 @@ fn start_next_job_if_idle(state: AppState) {
         let (state_value, result_value, error_value) = match run_outcome {
             Ok(Ok(v)) => (JobState::Succeeded, Some(v), None),
             Ok(Err(e)) => (JobState::Failed, None, Some(e.to_string())),
-            Err(e) => (
-                JobState::Failed,
-                None,
-                Some(format!("job task failed: {}", e)),
-            ),
+            Err(e) => (JobState::Failed, None, Some(format!("job task failed: {}", e))),
         };
         if let Some(job) = jobs.find_mut(&maybe_job_id) {
             job.state = state_value;
@@ -616,25 +607,25 @@ fn start_next_job_if_idle(state: AppState) {
 async fn ontology_sources(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let artifacts = OntologyEngine::list_artifacts(&state.pack).map_err(|e| {
+    let candidates = OntologyEngine::source_candidates(&state.pack).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":{"code":"ONTOLOGY_LIST_FAILED","message":e.to_string()}})),
         )
     })?;
     let mut out = Vec::new();
-    for path in artifacts {
-        match OntologyEngine::read_artifact(&path) {
+    for candidate in candidates {
+        match OntologyEngine::read_artifact(&candidate.artifact_path) {
             Ok(artifact) => out.push(json!({
                 "source_path": artifact.source_path,
                 "provider": artifact.provider,
                 "model": artifact.model,
                 "chunk_count": artifact.chunk_count,
                 "generated_at": artifact.generated_at,
-                "artifact_path": path.display().to_string()
+                "artifact_path": candidate.artifact_path.display().to_string()
             })),
             Err(e) => out.push(json!({
-                "artifact_path": path.display().to_string(),
+                "artifact_path": candidate.artifact_path.display().to_string(),
                 "error": e.to_string()
             })),
         }
@@ -646,18 +637,50 @@ async fn ontology_source(
     State(state): State<AppState>,
     axum::extract::Query(req): axum::extract::Query<OntologySourceQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let maybe_path = OntologyEngine::find_artifact_for_source(&state.pack, &req.path).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":{"code":"ONTOLOGY_SOURCE_LOOKUP_FAILED","message":e.to_string()}})),
-        )
-    })?;
+    let lookup_path = req.path.clone();
+    let lookup_normalized = canonicalize_if_exists(&lookup_path).unwrap_or_else(|| lookup_path.clone());
+    let maybe_path = OntologyEngine::find_artifact_for_source(&state.pack, &lookup_path)
+        .and_then(|v| {
+            if v.is_some() {
+                Ok(v)
+            } else {
+                OntologyEngine::find_artifact_for_source(&state.pack, &lookup_normalized)
+            }
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":{"code":"ONTOLOGY_SOURCE_LOOKUP_FAILED","message":e.to_string()}})),
+            )
+        })?;
     let Some(path) = maybe_path else {
+        let candidates = OntologyEngine::source_candidates(&state.pack).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":{"code":"ONTOLOGY_SOURCE_LOOKUP_FAILED","message":e.to_string()}})),
+            )
+        })?;
+        let is_directory = FsPath::new(&lookup_normalized).is_dir();
+        let suggestions = suggestion_candidates(&lookup_normalized, is_directory, &candidates, 10)
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "source_path": c.source_path,
+                    "artifact_path": c.artifact_path.display().to_string()
+                })
+            })
+            .collect::<Vec<_>>();
         return Err((
             StatusCode::NOT_FOUND,
-            Json(
-                json!({"error":{"code":"ONTOLOGY_SOURCE_NOT_FOUND","message":"no ontology artifact for source"}}),
-            ),
+            Json(json!({
+                "error":{
+                    "code":"ONTOLOGY_SOURCE_NOT_FOUND",
+                    "message":"no ontology artifact for source",
+                    "lookup_path": lookup_path,
+                    "is_directory": is_directory,
+                    "suggestions": suggestions
+                }
+            })),
         ));
     };
 
@@ -672,6 +695,103 @@ async fn ontology_source(
         "artifact_path": path.display().to_string(),
         "artifact": artifact
     })))
+}
+
+fn suggestion_candidates(
+    lookup_path: &str,
+    is_directory: bool,
+    candidates: &[crate::ontology::OntologySourceCandidate],
+    limit: usize,
+) -> Vec<crate::ontology::OntologySourceCandidate> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    if is_directory {
+        let by_prefix = OntologyEngine::filter_candidates_by_prefix(candidates, lookup_path);
+        if by_prefix.is_empty() {
+            return candidates.iter().take(limit).cloned().collect();
+        }
+        return by_prefix.into_iter().take(limit).collect();
+    }
+
+    let lookup = FsPath::new(lookup_path);
+    let parent = lookup.parent().and_then(|p| p.to_str()).unwrap_or("");
+    let file_name = lookup.file_name().and_then(|f| f.to_str()).unwrap_or("");
+
+    let mut scored = candidates
+        .iter()
+        .map(|c| {
+            let mut score = 0i32;
+            if !parent.is_empty() && c.source_path.starts_with(parent) {
+                score += 2;
+            }
+            if !file_name.is_empty() && c.source_path.contains(file_name) {
+                score += 1;
+            }
+            (score, c.clone())
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.source_path.cmp(&b.1.source_path)));
+    scored
+        .into_iter()
+        .filter(|(score, _)| *score > 0)
+        .map(|(_, c)| c)
+        .take(limit)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::ontology::OntologySourceCandidate;
+
+    use super::suggestion_candidates;
+
+    #[test]
+    fn directory_lookup_returns_prefix_matches() {
+        let candidates = vec![
+            OntologySourceCandidate {
+                source_path: "/repo/specs/a.md".to_string(),
+                artifact_path: PathBuf::from("/tmp/a.json"),
+            },
+            OntologySourceCandidate {
+                source_path: "/repo/specs/b.md".to_string(),
+                artifact_path: PathBuf::from("/tmp/b.json"),
+            },
+            OntologySourceCandidate {
+                source_path: "/repo/src/main.rs".to_string(),
+                artifact_path: PathBuf::from("/tmp/c.json"),
+            },
+        ];
+
+        let out = suggestion_candidates("/repo/specs", true, &candidates, 10);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|c| c.source_path.starts_with("/repo/specs")));
+    }
+
+    #[test]
+    fn file_lookup_prefers_same_parent() {
+        let candidates = vec![
+            OntologySourceCandidate {
+                source_path: "/repo/specs/a.md".to_string(),
+                artifact_path: PathBuf::from("/tmp/a.json"),
+            },
+            OntologySourceCandidate {
+                source_path: "/repo/specs/b.md".to_string(),
+                artifact_path: PathBuf::from("/tmp/b.json"),
+            },
+            OntologySourceCandidate {
+                source_path: "/repo/docs/readme.md".to_string(),
+                artifact_path: PathBuf::from("/tmp/c.json"),
+            },
+        ];
+
+        let out = suggestion_candidates("/repo/specs/missing.md", false, &candidates, 10);
+        assert!(!out.is_empty());
+        assert!(out[0].source_path.starts_with("/repo/specs"));
+    }
 }
 
 async fn mcp(

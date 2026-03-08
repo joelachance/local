@@ -49,6 +49,12 @@ pub struct OntologyArtifact {
     pub relations: Vec<OntologyRelation>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OntologySourceCandidate {
+    pub source_path: String,
+    pub artifact_path: PathBuf,
+}
+
 pub trait OntologyProvider {
     fn provider_name(&self) -> &'static str;
     fn model_name(&self) -> String;
@@ -153,16 +159,18 @@ impl OntologyEngine {
         let provider: Box<dyn OntologyProvider + Send> = match config.provider {
             OntologyProviderKind::Rules => Box::new(RuleOntologyProvider),
             OntologyProviderKind::Candle => Box::new(CandleOntologyProvider::new(config.clone())),
-            OntologyProviderKind::Llama => match LlamaOntologyProvider::new(config.clone()) {
-                Ok(p) => Box::new(p),
-                Err(err) => {
-                    eprintln!(
-                        "warning: failed to initialize llama ontology provider ({}), using rules fallback",
-                        err
-                    );
-                    Box::new(RuleOntologyProvider)
+            OntologyProviderKind::Llama => {
+                match LlamaOntologyProvider::new(config.clone()) {
+                    Ok(p) => Box::new(p),
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed to initialize llama ontology provider ({}), using rules fallback",
+                            err
+                        );
+                        Box::new(RuleOntologyProvider)
+                    }
                 }
-            },
+            }
         };
         Ok(Self {
             pack_dir: pack_dir.to_path_buf(),
@@ -195,10 +203,7 @@ impl OntologyEngine {
             .provider
             .extract(content, max_entities)
             .unwrap_or_else(|err| {
-                eprintln!(
-                    "warning: ontology extraction failed ({}), using rules fallback",
-                    err
-                );
+                eprintln!("warning: ontology extraction failed ({}), using rules fallback", err);
                 let mut fallback = RuleOntologyProvider;
                 fallback.extract(content, max_entities).unwrap_or_default()
             });
@@ -307,6 +312,31 @@ impl OntologyEngine {
         }
         out.sort();
         Ok(out)
+    }
+
+    pub fn source_candidates(pack_dir: &Path) -> Result<Vec<OntologySourceCandidate>> {
+        let mut out = Vec::new();
+        for artifact_path in Self::list_artifacts(pack_dir)? {
+            if let Ok(artifact) = Self::read_artifact(&artifact_path) {
+                out.push(OntologySourceCandidate {
+                    source_path: artifact.source_path,
+                    artifact_path,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+        Ok(out)
+    }
+
+    pub fn filter_candidates_by_prefix(
+        candidates: &[OntologySourceCandidate],
+        prefix: &str,
+    ) -> Vec<OntologySourceCandidate> {
+        candidates
+            .iter()
+            .filter(|c| c.source_path.starts_with(prefix))
+            .cloned()
+            .collect()
     }
 
     pub fn read_artifact(path: &Path) -> Result<OntologyArtifact> {
@@ -424,6 +454,13 @@ mod tests {
             )
             .expect("artifact should be written");
         assert!(out.exists());
+        let found = OntologyEngine::find_artifact_for_source(&pack_dir, "/tmp/demo-source")
+            .expect("lookup should succeed");
+        assert!(found.is_some());
+        let candidates = OntologyEngine::source_candidates(&pack_dir).expect("should list candidates");
+        assert_eq!(candidates.len(), 1);
+        let filtered = OntologyEngine::filter_candidates_by_prefix(&candidates, "/tmp");
+        assert_eq!(filtered.len(), 1);
 
         let _ = fs::remove_dir_all(pack_dir);
     }

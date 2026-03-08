@@ -181,11 +181,7 @@ pub async fn sources_add(cfg: &DaemonConfig, path: &str) -> Result<Value> {
 pub async fn sources_remove(cfg: &DaemonConfig, path: &str) -> Result<Value> {
     let client = http_client()?;
     let url = format!("{}/sources", cfg.base_url());
-    let resp = client
-        .delete(url)
-        .json(&json!({"path": path}))
-        .send()
-        .await?;
+    let resp = client.delete(url).json(&json!({"path": path})).send().await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
@@ -213,6 +209,42 @@ pub async fn ontology_show(cfg: &DaemonConfig, source: &str) -> Result<Value> {
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&body) {
+            let code = parsed
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            let message = parsed
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("ontology lookup failed");
+            let mut details = format!("ontology show failed [{code}]: {message}");
+            let suggestions = parsed
+                .get("error")
+                .and_then(|e| e.get("suggestions"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !suggestions.is_empty() {
+                details.push_str("\nSuggestions:");
+                for (idx, item) in suggestions.iter().take(5).enumerate() {
+                    if let Some(source_path) = item.get("source_path").and_then(Value::as_str) {
+                        details.push_str(&format!(
+                            "\n  {}. {}",
+                            idx + 1,
+                            source_path
+                        ));
+                        details.push_str(&format!(
+                            "\n     try: satori ontology show --source \"{}\"",
+                            source_path
+                        ));
+                    }
+                }
+            }
+            return Err(anyhow!(details));
+        }
         return Err(anyhow!("ontology show failed: {}", body));
     }
     Ok(serde_json::from_str(&body)?)
