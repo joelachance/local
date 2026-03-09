@@ -29,8 +29,11 @@ else
   nohup env \
     FALKORDB_SOCKET="$SOCKET_PATH" \
     LANCEDB_PATH="$LANCEDB_PATH" \
+    GRAPH_PATH="$GRAPH_PATH" \
+    PACK_PATH="$PACK_PATH" \
     API_PORT="$API_PORT" \
     AUTH_SECRET="$AUTH_SECRET" \
+    ${SATORI_ONTOLOGY_MODEL:+SATORI_ONTOLOGY_MODEL="$SATORI_ONTOLOGY_MODEL"} \
     "${ROOT_DIR}/target/release/satori" \
     --headless-serve \
     --pack "$PACK_PATH" \

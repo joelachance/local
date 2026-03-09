@@ -29,6 +29,8 @@ This starts:
 
 On first run, FalkorDB sidecar artifacts are downloaded and verified into `./.local-runtime/falkor/`.
 
+For query synthesis (natural language answers), run `bun run models:fetch` once to download a small GGUF model (~700MB) into `./.local-runtime/models/` (or set `SATORI_ONTOLOGY_MODEL` to your own GGUF path).
+
 Stop services:
 
 ```bash
@@ -59,7 +61,7 @@ curl -s http://127.0.0.1:4242/health
 - `API_PORT` (default `4242` for runtime scripts; `--headless-serve` still defaults to `7821` when called directly)
 - `AUTH_SECRET` (recommended; used as required runtime secret contract)
 - `SATORI_ONTOLOGY_PROVIDER` (`llama` default; `rules` or `candle` optional)
-- `SATORI_ONTOLOGY_MODEL` (GGUF model path for llama provider)
+- `SATORI_ONTOLOGY_MODEL` (GGUF model path; default `.local-runtime/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` after `bun run models:fetch`)
 - `SATORI_ONTOLOGY_MAX_TOKENS` (default `512`)
 - `SATORI_ONTOLOGY_TIMEOUT_MS` (default `20000`)
 

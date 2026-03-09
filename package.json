@@ -8,6 +8,7 @@
     "local:status": "./scripts/local-status.sh",
     "daemon:start": "./scripts/daemon-start.sh",
     "daemon:stop": "./scripts/daemon-stop.sh",
-    "daemon:status": "./scripts/daemon-status.sh"
+    "daemon:status": "./scripts/daemon-status.sh",
+    "models:fetch": "./scripts/model-fetch.sh"
   }
 }
