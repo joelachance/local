@@ -19,7 +19,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 #[cfg(feature = "llama-embedded")]
 use std::num::NonZeroU32;
 #[cfg(feature = "llama-embedded")]
-use std::sync::OnceLock;
+use std::sync::{Mutex, Once, OnceLock};
 #[cfg(feature = "llama-embedded")]
 use std::time::Instant;
 
@@ -42,6 +42,18 @@ struct LlamaRelation {
     source: String,
     relation: String,
     target: String,
+}
+
+/// Run generic prompt completion using the Llama stack. Used by query synthesis.
+/// Reuses SATORI_ONTOLOGY_MODEL, SATORI_ONTOLOGY_MAX_TOKENS, SATORI_ONTOLOGY_TIMEOUT_MS.
+/// If `max_tokens_override` is Some, limits output to that many tokens (e.g. 80 for short answers).
+pub fn generate_completion(
+    prompt: &str,
+    config: &OntologyConfig,
+    max_tokens_override: Option<usize>,
+) -> Result<String> {
+    let provider = LlamaOntologyProvider::new(config.clone())?;
+    provider.run_completion(prompt, max_tokens_override)
 }
 
 impl LlamaOntologyProvider {
@@ -67,19 +79,24 @@ impl LlamaOntologyProvider {
     }
 
     fn run_llama_inference(&self, content: &str, max_entities: usize) -> Result<String> {
+        // Keep prompt bounded for predictable local latency.
+        let bounded_content = if content.len() > 8000 {
+            &content[..8000]
+        } else {
+            content
+        };
+        let prompt = format!(
+            "Extract ontology as STRICT JSON only with shape {{\"entities\":[string],\"relations\":[{{\"source\":string,\"relation\":string,\"target\":string}}],\"confidence\":number}}. \
+Keep at most {max_entities} entities and at most 24 relations. Output JSON only.\nContent:\n{bounded_content}"
+        );
+        self.run_completion(&prompt, None)
+    }
+
+    /// Run generic prompt completion. Used by ontology extraction and query synthesis.
+    pub fn run_completion(&self, prompt: &str, max_tokens_override: Option<usize>) -> Result<String> {
+        let max_tokens = max_tokens_override.unwrap_or(self.config.max_tokens).max(64);
         #[cfg(feature = "llama-embedded")]
         {
-            // Keep prompt bounded for predictable local latency.
-            let bounded_content = if content.len() > 8000 {
-                &content[..8000]
-            } else {
-                content
-            };
-            let prompt = format!(
-                "Extract ontology as STRICT JSON only with shape {{\"entities\":[string],\"relations\":[{{\"source\":string,\"relation\":string,\"target\":string}}],\"confidence\":number}}. \
-Keep at most {max_entities} entities and at most 24 relations. Output JSON only.\nContent:\n{bounded_content}"
-            );
-
             let backend = llama_backend()?;
             let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(
                 NonZeroU32::new(2048).ok_or_else(|| anyhow!("invalid n_ctx"))?,
@@ -87,8 +104,8 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
             let threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            ctx_params = ctx_params.with_n_threads(threads);
-            ctx_params = ctx_params.with_n_threads_batch(threads);
+            ctx_params = ctx_params.with_n_threads(threads as i32);
+            ctx_params = ctx_params.with_n_threads_batch(threads as i32);
 
             let mut ctx = self
                 .model
@@ -104,7 +121,7 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
             }
 
             let mut batch = LlamaBatch::new(
-                usize::max(prompt_tokens.len() + self.config.max_tokens + 8, 512),
+                usize::max(prompt_tokens.len() + max_tokens + 8, 512),
                 1,
             );
             let last_index = (prompt_tokens.len() - 1) as i32;
@@ -122,7 +139,6 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
             let mut out = String::new();
             let start = Instant::now();
             let timeout = self.config.timeout_ms;
-            let max_tokens = self.config.max_tokens.max(64);
             let mut n_cur = batch.n_tokens();
 
             for _ in 0..max_tokens {
@@ -159,20 +175,11 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
 
         #[cfg(not(feature = "llama-embedded"))]
         {
-            let bounded_content = if content.len() > 8000 {
-                &content[..8000]
-            } else {
-                content
-            };
-            let prompt = format!(
-                "Extract ontology as STRICT JSON only with shape {{\"entities\":[string],\"relations\":[{{\"source\":string,\"relation\":string,\"target\":string}}],\"confidence\":number}}. \
-Keep at most {max_entities} entities and at most 24 relations. Output JSON only.\nContent:\n{bounded_content}"
-            );
             let output = std::process::Command::new("llama-cli")
                 .arg("-m")
                 .arg(&self.config.model)
                 .arg("-n")
-                .arg(self.config.max_tokens.to_string())
+                .arg(max_tokens.to_string())
                 .arg("-p")
                 .arg(prompt)
                 .output()
@@ -195,8 +202,20 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
 #[cfg(feature = "llama-embedded")]
 fn llama_backend() -> Result<&'static LlamaBackend> {
     static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
-    BACKEND.get_or_try_init(|| {
-        LlamaBackend::init().map_err(|e| anyhow!("failed to initialize llama backend: {}", e))
+    static INIT: Once = Once::new();
+    static INIT_ERROR: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    INIT.call_once(|| {
+        match LlamaBackend::init() {
+            Ok(b) => {
+                BACKEND.set(b).ok();
+            }
+            Err(e) => {
+                *INIT_ERROR.lock().unwrap() = Some(anyhow!("failed to initialize llama backend: {}", e));
+            }
+        }
+    });
+    BACKEND.get().ok_or_else(|| {
+        INIT_ERROR.lock().unwrap().take().unwrap_or_else(|| anyhow!("unknown init error"))
     })
 }
 
