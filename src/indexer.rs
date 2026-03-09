@@ -113,10 +113,10 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
     )
     .or_else(|e| {
         if manifest.embedding.provider == "fastembed" {
-            eprintln!(
+            crate::term::warn(format!(
                 "warning: fastembed init failed ({}), falling back to hash embeddings",
                 e
-            );
+            ));
             provider_from_name(
                 "hash",
                 &manifest.embedding.model,
@@ -238,7 +238,7 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
 
         if !paths_to_refresh.is_empty() {
             if let Err(e) = delete_chunks_for_paths(&socket_path, &graph_name, &paths_to_refresh) {
-                eprintln!("warning: failed deleting stale graph chunks: {e}");
+                crate::term::warn(format!("warning: failed deleting stale graph chunks: {e}"));
             }
         }
 
@@ -259,7 +259,7 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
                 })
                 .collect::<Vec<_>>();
             if let Err(e) = upsert_chunks(&socket_path, &graph_name, &graph_chunks) {
-                eprintln!("warning: failed writing chunks to falkor: {e}");
+                crate::term::warn(format!("warning: failed writing chunks to falkor: {e}"));
             }
         }
     }
@@ -279,14 +279,14 @@ pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, 
     for (source_path, contents) in source_contents {
         let hashes = source_hashes.get(&source_path).cloned().unwrap_or_default();
         if let Err(e) = ontology.write_artifact(&source_path, &contents, &hashes) {
-            eprintln!(
+            crate::term::warn(format!(
                 "warning: failed writing ontology artifact for {}: {}",
                 source_path, e
-            );
+            ));
         }
     }
     if let Err(e) = ontology.save() {
-        eprintln!("warning: failed writing ontology cache: {e}");
+        crate::term::warn(format!("warning: failed writing ontology cache: {e}"));
     }
 
     manifest.updated_at = Utc::now();

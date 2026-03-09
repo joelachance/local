@@ -1,5 +1,6 @@
 mod cli_client;
 mod embed;
+mod term;
 mod falkor_store;
 mod indexer;
 mod lancedb_store;

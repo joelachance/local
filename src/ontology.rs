@@ -89,14 +89,16 @@ pub struct OntologyConfig {
     pub provider: OntologyProviderKind,
     pub model: String,
     pub max_tokens: usize,
+    #[cfg_attr(not(feature = "llama-embedded"), allow(dead_code))]
     pub timeout_ms: u64,
 }
 
 impl OntologyConfig {
     pub fn from_env() -> Self {
         let provider = OntologyProviderKind::from_env();
-        let model = std::env::var("SATORI_ONTOLOGY_MODEL")
-            .unwrap_or_else(|_| "./models/ontology.gguf".to_string());
+        let model = std::env::var("SATORI_ONTOLOGY_MODEL").unwrap_or_else(|_| {
+            ".local-runtime/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string()
+        });
         let max_tokens = std::env::var("SATORI_ONTOLOGY_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -142,7 +144,6 @@ pub struct OntologyEngine {
     cache_path: PathBuf,
     cache: OntologyCache,
     provider: Box<dyn OntologyProvider + Send>,
-    config: OntologyConfig,
 }
 
 impl OntologyEngine {
@@ -163,10 +164,10 @@ impl OntologyEngine {
                 match LlamaOntologyProvider::new(config.clone()) {
                     Ok(p) => Box::new(p),
                     Err(err) => {
-                        eprintln!(
+                        crate::term::warn(format!(
                             "warning: failed to initialize llama ontology provider ({}), using rules fallback",
                             err
-                        );
+                        ));
                         Box::new(RuleOntologyProvider)
                     }
                 }
@@ -177,7 +178,6 @@ impl OntologyEngine {
             cache_path,
             cache,
             provider,
-            config,
         })
     }
 
@@ -203,7 +203,10 @@ impl OntologyEngine {
             .provider
             .extract(content, max_entities)
             .unwrap_or_else(|err| {
-                eprintln!("warning: ontology extraction failed ({}), using rules fallback", err);
+                crate::term::warn(format!(
+                    "warning: ontology extraction failed ({}), using rules fallback",
+                    err
+                ));
                 let mut fallback = RuleOntologyProvider;
                 fallback.extract(content, max_entities).unwrap_or_default()
             });
@@ -358,9 +361,6 @@ impl OntologyEngine {
         }
     }
 
-    pub fn config(&self) -> &OntologyConfig {
-        &self.config
-    }
 }
 
 fn extract_entities(content: &str, max_entities: usize) -> Vec<String> {

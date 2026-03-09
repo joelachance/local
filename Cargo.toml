@@ -9,6 +9,7 @@ llama-embedded = ["dep:llama-cpp-2", "dep:encoding_rs"]
 
 [dependencies]
 anyhow = "1"
+owo-colors = { version = "4", features = ["supports-colors"] }
 arrow-array = "57"
 arrow-schema = "57"
 axum = "0.8"

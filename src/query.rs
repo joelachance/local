@@ -63,10 +63,10 @@ pub fn run_query(pack_dir: &Path, q: &str, mode: &str, top_k: usize) -> Result<Q
     )
     .or_else(|e| {
         if manifest.embedding.provider == "fastembed" {
-            eprintln!(
+            crate::term::warn(format!(
                 "warning: fastembed query init failed ({}), falling back to hash embeddings",
                 e
-            );
+            ));
             provider_from_name(
                 "hash",
                 &manifest.embedding.model,
@@ -95,7 +95,9 @@ pub fn run_query(pack_dir: &Path, q: &str, mode: &str, top_k: usize) -> Result<Q
             if let Some(socket_path) = falkor_socket {
                 query_falkor_chunks(&socket_path, &graph_name, &query_text, top_for_backend)
                     .unwrap_or_else(|err| {
-                        eprintln!("warning: falkor query failed, continuing with lancedb: {err}");
+                        crate::term::warn(format!(
+                            "warning: falkor query failed, continuing with lancedb: {err}"
+                        ));
                         Vec::new()
                     })
             } else {
@@ -133,7 +135,7 @@ pub fn run_query(pack_dir: &Path, q: &str, mode: &str, top_k: usize) -> Result<Q
                     content: d.content.clone(),
                     start_offset: Some(d.start_offset),
                     end_offset: Some(d.end_offset),
-                    source: "index_fallback".to_string(),
+                    source: "vector".to_string(),
                     group_key: Some(d.source_path.clone()),
                 }
             })
@@ -148,11 +150,11 @@ pub fn run_query(pack_dir: &Path, q: &str, mode: &str, top_k: usize) -> Result<Q
             .entry(hit.chunk_id.clone())
             .and_modify(|e| {
                 e.score += rr;
-                e.source = "lancedb+fusion".to_string();
+                e.source = "vector".to_string();
             })
             .or_insert(QueryHit {
                 score: rr,
-                source: hit.source.clone(),
+                source: "vector".to_string(),
                 ..hit
             });
     }
@@ -162,15 +164,11 @@ pub fn run_query(pack_dir: &Path, q: &str, mode: &str, top_k: usize) -> Result<Q
             .entry(hit.chunk_id.clone())
             .and_modify(|e| {
                 e.score += rr;
-                if e.source == "lancedb+fusion" {
-                    e.source = "lancedb+falkor".to_string();
-                } else {
-                    e.source = "falkor+fusion".to_string();
-                }
+                e.source = if e.source == "vector" { "both" } else { "graph" }.to_string();
             })
             .or_insert(QueryHit {
                 score: rr,
-                source: "falkor".to_string(),
+                source: "graph".to_string(),
                 ..hit
             });
     }
