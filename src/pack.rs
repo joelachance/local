@@ -122,3 +122,53 @@ pub fn save_file_state(pack_dir: &Path, states: &[FileState]) -> Result<()> {
         .context("failed writing state/file_state.json")?;
     Ok(())
 }
+
+/// Copies a file into the pack root and returns the destination path.
+/// Preserves the file name; overwrites if destination exists.
+pub fn copy_file_to_pack(source: &Path, pack_root: &Path) -> Result<PathBuf> {
+    if !source.is_file() {
+        bail!("not a file: {}", source.display());
+    }
+    let name = source
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid source path"))?;
+    let dest = pack_root.join(name);
+    fs::copy(source, &dest).context("failed to copy file")?;
+    Ok(dest)
+}
+
+/// Memkit artifacts to remove when scrubbing. Covers both .memkit layout and legacy root layout.
+const MEMKIT_ARTIFACTS: &[&str] = &[
+    ".memkit",
+    "manifest.json",
+    "index.json",
+    "config.json",
+    "state",
+    "lancedb",
+    "logs",
+    "ontology",
+];
+
+/// Scrubs the memory pack from a directory. Removes .memkit, lancedb, manifest.json,
+/// and any other files that support memkit.
+pub fn scrub_pack_from_dir(dir: &Path) -> Result<()> {
+    let mut removed_any = false;
+    for name in MEMKIT_ARTIFACTS {
+        let p = dir.join(name);
+        if p.exists() {
+            if p.is_dir() {
+                fs::remove_dir_all(&p).with_context(|| format!("failed to remove {}", p.display()))?;
+            } else {
+                fs::remove_file(&p).with_context(|| format!("failed to remove {}", p.display()))?;
+            }
+            removed_any = true;
+        }
+    }
+    if !removed_any {
+        bail!(
+            "not a memory pack: {} (no .memkit, manifest.json, lancedb, or other memkit artifacts)",
+            dir.display()
+        );
+    }
+    Ok(())
+}
