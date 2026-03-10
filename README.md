@@ -19,8 +19,9 @@ cargo build --release
 # Start server (FalkorDB sidecar + API)
 ./scripts/local-start.sh
 
-# Or run server directly
+# Or run server directly (single or multiple packs, comma-delimited)
 mk serve --pack ./memory-pack
+mk serve --pack ./pack1,./pack2
 
 # CLI commands (require server to be running)
 mk list
@@ -32,7 +33,7 @@ mk graph
 
 ## Commands
 
-- `mk serve [--pack <path>] [--host] [--port]` — Start the server (API, MCP, SDK)
+- `mk serve [--pack <path>] [--host] [--port]` — Start the server. `--pack` accepts comma-delimited paths for multi-pack mode.
 - `mk status [dir]` — With dir: show status for that pack. Without dir: show mk list
 - `mk list` — List indexed directories with [local] [cloud]
 - `mk index <dir>` — Start background index job, print job id
@@ -46,6 +47,7 @@ mk graph
 - `LANCEDB_PATH` (default `./.local-data/lance`)
 - `API_PORT` (default `4242`)
 - `MEMKIT_PACK_PATH` (default `./memory-pack` when using serve)
+- `MEMKIT_PACK_PATHS` — Comma-delimited pack paths for multi-pack mode (overrides `MEMKIT_PACK_PATH` when set)
 - `MEMKIT_ONTOLOGY_PROVIDER` (`llama` default; `rules` or `candle` optional)
 - `MEMKIT_ONTOLOGY_MODEL` (GGUF model path for query synthesis)
 - `MEMKIT_ONTOLOGY_MAX_TOKENS` (default `512`)

@@ -10,11 +10,13 @@ SOCKET_PATH="${FALKORDB_SOCKET:-/tmp/falkordb.sock}"
 LANCEDB_PATH="${LANCEDB_PATH:-${DATA_DIR}/lance}"
 GRAPH_PATH="${GRAPH_PATH:-${DATA_DIR}/graph}"
 PACK_PATH="${PACK_PATH:-${ROOT_DIR}/memory-pack}"
+PACK_PATHS="${PACK_PATHS:-$PACK_PATH}"
 API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${API_PORT:-4242}"
 AUTH_SECRET="${AUTH_SECRET:-dev-local-secret}"
 
-mkdir -p "$RUN_DIR" "$LANCEDB_PATH" "$GRAPH_PATH" "$PACK_PATH"
+mkdir -p "$RUN_DIR" "$LANCEDB_PATH" "$GRAPH_PATH"
+for p in $(echo "$PACK_PATHS" | tr ',' ' '); do mkdir -p "$p"; done
 
 if [ ! -x "${ROOT_DIR}/target/release/mk" ]; then
   "${SCRIPT_DIR}/local-build.sh"
@@ -30,13 +32,13 @@ else
     FALKORDB_SOCKET="$SOCKET_PATH" \
     LANCEDB_PATH="$LANCEDB_PATH" \
     GRAPH_PATH="$GRAPH_PATH" \
-    PACK_PATH="$PACK_PATH" \
+    MEMKIT_PACK_PATHS="$PACK_PATHS" \
     API_PORT="$API_PORT" \
     AUTH_SECRET="$AUTH_SECRET" \
     ${MEMKIT_ONTOLOGY_MODEL:+MEMKIT_ONTOLOGY_MODEL="$MEMKIT_ONTOLOGY_MODEL"} \
     "${ROOT_DIR}/target/release/mk" \
     serve \
-    --pack "$PACK_PATH" \
+    --pack "$PACK_PATHS" \
     --host "$API_HOST" \
     --port "$API_PORT" \
     > "${RUN_DIR}/memkit-api.log" 2>&1 &
