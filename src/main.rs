@@ -2,6 +2,7 @@ mod cli_client;
 mod file_tree;
 mod memkit_txt;
 mod registry;
+mod validate;
 mod embed;
 mod term;
 mod falkor_store;
@@ -21,6 +22,58 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Json,
+    Text,
+}
+
+#[derive(Clone)]
+struct CliContext {
+    output_format: OutputFormat,
+    dry_run: bool,
+}
+
+fn parse_global_flags(args: &[String]) -> (Vec<String>, CliContext) {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut output_format = OutputFormat::Text;
+    let mut dry_run = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    if v == "json" {
+                        output_format = OutputFormat::Json;
+                    }
+                    i += 1;
+                }
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            other => {
+                filtered.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    if let Ok(fmt) = env::var("OUTPUT_FORMAT") {
+        if fmt == "json" {
+            output_format = OutputFormat::Json;
+        }
+    }
+    (
+        filtered,
+        CliContext {
+            output_format,
+            dry_run,
+        },
+    )
+}
 use colored_json::to_colored_json_auto;
 use owo_colors::OwoColorize;
 
@@ -50,6 +103,7 @@ enum CliCommand {
         raw: bool,
         pack: Option<String>,
     },
+    Schema { command: Option<String> },
     Help,
 }
 
@@ -88,6 +142,24 @@ fn parse_pack_paths(value: &str) -> Vec<PathBuf> {
         .map(|s| PathBuf::from(s.trim()))
         .filter(|p| !p.as_os_str().is_empty())
         .collect()
+}
+
+fn extract_json_from_args(args: &[String]) -> (Option<serde_json::Value>, Vec<String>) {
+    let mut filtered = Vec::new();
+    let mut json_value = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args.get(i).map(|s| s.as_str()) == Some("--json") && i + 1 < args.len() {
+            if let Ok(v) = serde_json::from_str(args[i + 1].as_str()) {
+                json_value = Some(v);
+            }
+            i += 2;
+        } else {
+            filtered.push(args[i].clone());
+            i += 1;
+        }
+    }
+    (json_value, filtered)
 }
 
 fn parse_serve(args: &[String]) -> Result<Option<ServeConfig>> {
@@ -160,15 +232,27 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
 
     match args[0].as_str() {
         "add" => {
-            let path = args
-                .get(1)
+            let (json_val, rest) = extract_json_from_args(&args[1..]);
+            if let Some(j) = json_val {
+                let path = j
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| anyhow!("--json must include \"path\""))?;
+                let pack = j.get("pack").and_then(serde_json::Value::as_str).map(String::from);
+                crate::validate::validate_path(&path)?;
+                return Ok(CliCommand::Add { path, pack });
+            }
+            let path = rest
+                .first()
                 .cloned()
-                .ok_or_else(|| anyhow!("usage: mk add <path> [--pack <dir>]"))?;
+                .ok_or_else(|| anyhow!("usage: mk add <path> [--pack <dir>] or mk add --json '{{\"path\":\"...\"}}'"))?;
+            crate::validate::validate_path(&path)?;
             let mut pack = None;
-            let mut i = 2usize;
-            while i < args.len() {
-                if args[i] == "--pack" && args.get(i + 1).is_some() {
-                    pack = args.get(i + 1).cloned();
+            let mut i = 1usize;
+            while i < rest.len() {
+                if rest[i] == "--pack" && rest.get(i + 1).is_some() {
+                    pack = rest.get(i + 1).cloned();
                     i += 2;
                 } else {
                     i += 1;
@@ -177,27 +261,69 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
             Ok(CliCommand::Add { path, pack })
         }
         "remove" => {
-            let dir = args.get(1).cloned();
+            let (json_val, rest) = extract_json_from_args(&args[1..]);
+            if let Some(j) = json_val {
+                let dir = j.get("dir").and_then(serde_json::Value::as_str).map(String::from);
+                if let Some(ref d) = dir {
+                    crate::validate::validate_path(d)?;
+                }
+                return Ok(CliCommand::Remove { dir });
+            }
+            let dir = rest.first().cloned();
+            if let Some(ref d) = dir {
+                crate::validate::validate_path(d)?;
+            }
             Ok(CliCommand::Remove { dir })
         }
         "status" => {
-            let dir = args.get(1).cloned();
+            let (json_val, rest) = extract_json_from_args(&args[1..]);
+            if let Some(j) = json_val {
+                let dir = j.get("dir").and_then(serde_json::Value::as_str).map(String::from);
+                if let Some(ref d) = dir {
+                    crate::validate::validate_path(d)?;
+                }
+                return Ok(CliCommand::Status { dir });
+            }
+            let dir = rest.first().cloned();
+            if let Some(ref d) = dir {
+                crate::validate::validate_path(d)?;
+            }
             Ok(CliCommand::Status { dir })
         }
         "list" => Ok(CliCommand::List),
         "index" => {
-            let dir = args
-                .get(1)
+            let (json_val, rest) = extract_json_from_args(&args[1..]);
+            if let Some(j) = json_val {
+                let dir = j
+                    .get("dir")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| anyhow!("--json must include \"dir\""))?;
+                crate::validate::validate_path(&dir)?;
+                return Ok(CliCommand::Index { dir });
+            }
+            let dir = rest
+                .first()
                 .cloned()
-                .ok_or_else(|| anyhow!("usage: mk index <dir>"))?;
+                .ok_or_else(|| anyhow!("usage: mk index <dir> or mk index --json '{{\"dir\":\"...\"}}'"))?;
+            crate::validate::validate_path(&dir)?;
             Ok(CliCommand::Index { dir })
         }
         "graph" => {
+            let (json_val, rest) = extract_json_from_args(&args[1..]);
+            if let Some(j) = json_val {
+                let pack = j.get("pack").and_then(serde_json::Value::as_str).map(String::from);
+                if let Some(ref p) = pack {
+                    crate::validate::validate_path(p)?;
+                }
+                return Ok(CliCommand::Graph { pack });
+            }
             let mut pack = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                if args[i] == "--pack" && args.get(i + 1).is_some() {
-                    pack = args.get(i + 1).cloned();
+            let mut i = 0usize;
+            while i < rest.len() {
+                if rest[i] == "--pack" && rest.get(i + 1).is_some() {
+                    pack = rest.get(i + 1).cloned();
+                    crate::validate::validate_path(pack.as_ref().unwrap())?;
                     i += 2;
                 } else {
                     i += 1;
@@ -206,45 +332,87 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
             Ok(CliCommand::Graph { pack })
         }
         "query" => {
-            if args.len() < 2 {
+            let (json_val, rest) = extract_json_from_args(&args[1..]);
+            if let Some(j) = json_val {
+                let query = j
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| anyhow!("--json must include \"query\""))?;
+                crate::validate::reject_control_chars(&query)?;
+                let mode = j
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("hybrid")
+                    .to_string();
+                let top_k = j
+                    .get("top_k")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(8) as usize;
+                let raw = j.get("raw").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                let pack = j.get("pack").and_then(serde_json::Value::as_str).map(String::from);
+                if let Some(ref p) = pack {
+                    crate::validate::validate_path(p)?;
+                }
+                return Ok(CliCommand::Query {
+                    query,
+                    mode,
+                    top_k,
+                    raw,
+                    pack,
+                });
+            }
+            if rest.is_empty() {
                 return Err(anyhow!(
-                    "usage: mk query <text> [--mode hybrid|vector] [--top-k N] [--pack <dir>] [--raw]"
+                    "usage: mk query <text> [--mode hybrid|vector] [--top-k N] [--pack <dir>] [--raw] or mk query --json '{{\"query\":\"...\"}}'"
                 ));
             }
-            let query = args[1].clone();
+            let query = rest[0].clone();
+            crate::validate::reject_control_chars(&query)?;
             let mut mode = "hybrid".to_string();
             let mut top_k = 8usize;
             let mut raw = false;
             let mut pack = None;
-            let mut i = 2usize;
-            while i < args.len() {
-                match args[i].as_str() {
+            let mut i = 1usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
                     "--mode" => {
                         i += 1;
-                        mode = args
+                        mode = rest
                             .get(i)
                             .cloned()
                             .ok_or_else(|| anyhow!("missing value for --mode"))?;
                     }
                     "--top-k" => {
                         i += 1;
-                        let v = args
-                            .get(i)
-                            .ok_or_else(|| anyhow!("missing value for --top-k"))?;
+                        let v = rest.get(i).ok_or_else(|| anyhow!("missing value for --top-k"))?;
                         top_k = v
                             .parse::<usize>()
                             .map_err(|_| anyhow!("invalid --top-k value: {}", v))?;
                     }
                     "--pack" => {
                         i += 1;
-                        pack = args.get(i).cloned();
+                        pack = rest.get(i).cloned();
+                        if let Some(ref p) = pack {
+                            crate::validate::validate_path(p)?;
+                        }
                     }
                     "--raw" => raw = true,
                     other => return Err(anyhow!("unsupported query argument: {}", other)),
                 }
                 i += 1;
             }
-            Ok(CliCommand::Query { query, mode, top_k, raw, pack })
+            Ok(CliCommand::Query {
+                query,
+                mode,
+                top_k,
+                raw,
+                pack,
+            })
+        }
+        "schema" => {
+            let command = args.get(1).cloned();
+            Ok(CliCommand::Schema { command })
         }
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(anyhow!(
@@ -252,6 +420,95 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
             other
         )),
     }
+}
+
+const SCHEMA_COMMANDS: &[&str] = &["add", "remove", "status", "index", "graph", "query"];
+
+fn schema_for_command(cmd: &str) -> Option<serde_json::Value> {
+    Some(match cmd {
+        "add" => serde_json::json!({
+            "command": "add",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to file or directory to add"},
+                    "pack": {"type": "string", "description": "Pack directory (optional)"}
+                },
+                "required": ["path"]
+            }
+        }),
+        "remove" => serde_json::json!({
+            "command": "remove",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "dir": {"type": "string", "description": "Directory to remove pack from (optional)"}
+                }
+            }
+        }),
+        "status" => serde_json::json!({
+            "command": "status",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "dir": {"type": "string", "description": "Pack directory (optional)"}
+                }
+            }
+        }),
+        "index" => serde_json::json!({
+            "command": "index",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "dir": {"type": "string", "description": "Directory to index"}
+                },
+                "required": ["dir"]
+            }
+        }),
+        "graph" => serde_json::json!({
+            "command": "graph",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "pack": {"type": "string", "description": "Pack directory (optional)"}
+                }
+            }
+        }),
+        "query" => serde_json::json!({
+            "command": "query",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language query"},
+                    "mode": {"type": "string", "enum": ["vector", "hybrid"], "default": "hybrid"},
+                    "top_k": {"type": "integer", "default": 8},
+                    "raw": {"type": "boolean", "default": false},
+                    "pack": {"type": "string", "description": "Pack directory (optional)"}
+                },
+                "required": ["query"]
+            }
+        }),
+        _ => return None,
+    })
+}
+
+fn print_schema(cmd: Option<&str>) -> Result<()> {
+    match cmd {
+        None => {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "commands": SCHEMA_COMMANDS,
+                "usage": "mk schema <command>"
+            }))?);
+        }
+        Some(c) => {
+            if let Some(schema) = schema_for_command(c) {
+                println!("{}", serde_json::to_string_pretty(&schema)?);
+            } else {
+                anyhow::bail!("unknown schema: {}. available: {}", c, SCHEMA_COMMANDS.join(", "));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_help() {
@@ -269,6 +526,8 @@ fn print_help() {
         "Usage:".to_string()
     };
     println!("{}", usage);
+    println!("  Global flags: [--output json|text] [--dry-run]");
+    println!();
     let commands = [
         "  mk serve [--pack <path>] [--host <host>] [--port <port>]",
         "  mk add <path> [--pack <dir>]",
@@ -278,6 +537,7 @@ fn print_help() {
         "  mk index <dir>",
         "  mk graph [--pack <dir>]",
         "  mk query <text> [--mode hybrid|vector] [--top-k N] [--pack <dir>] [--raw]",
+        "  mk schema [command]",
     ];
     for cmd in commands {
         if color {
@@ -291,9 +551,14 @@ fn print_help() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    let (args, ctx) = parse_global_flags(&args);
 
     match parse_cli_command(&args)? {
         CliCommand::Help => print_help(),
+        CliCommand::Schema { command } => {
+            print_schema(command.as_deref())?;
+            return Ok(());
+        }
         CliCommand::Serve(cfg) => {
             serve_with_startup(cfg.packs, cfg.host, cfg.port).await?;
         }
@@ -309,6 +574,16 @@ async fn main() -> Result<()> {
                     let target = target
                         .canonicalize()
                         .with_context(|| format!("path not found: {}", target.display()))?;
+                    if ctx.dry_run {
+                        let out = serde_json::json!({
+                            "dry_run": true,
+                            "would": "remove",
+                            "dir": target.display().to_string(),
+                            "status": "skipped"
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                        return Ok(());
+                    }
                     scrub_pack_from_dir(&target)?;
                     if crate::term::color_stdout() {
                         println!("{} scrubbed from {}", "Memory pack removed".green(), target.display());
@@ -323,6 +598,18 @@ async fn main() -> Result<()> {
             cli_client::ensure_server(&cfg).await?;
             let out = match cmd {
                 CliCommand::Add { path, pack } => {
+                    if ctx.dry_run {
+                        let pack_display = pack.as_deref().unwrap_or("(default)");
+                        let out = serde_json::json!({
+                            "dry_run": true,
+                            "would": "add",
+                            "path": path,
+                            "pack": pack_display,
+                            "status": "skipped"
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                        return Ok(());
+                    }
                     let source = PathBuf::from(&path)
                         .canonicalize()
                         .with_context(|| format!("file not found: {}", path))?;
@@ -346,29 +633,45 @@ async fn main() -> Result<()> {
                     } else {
                         println!("Copied {} -> {}", source.display(), dest.display());
                     }
-                    cli_client::index(&cfg, pack_root.to_string_lossy().as_ref()).await?
+                    cli_client::index(&cfg, pack_root.to_string_lossy().as_ref(), false, ctx.output_format == OutputFormat::Json).await?
                 }
                 CliCommand::Status { dir } => {
+                    let output_json = ctx.output_format == OutputFormat::Json;
                     if dir.is_none() {
-                        cli_client::list(&cfg).await?;
+                        let data = cli_client::list(&cfg, output_json).await?;
+                        if output_json {
+                            let json_str = serde_json::to_string_pretty(&data)?;
+                            println!("{}", json_str);
+                        }
                         return Ok(());
                     }
                     let data = cli_client::status(&cfg, dir.as_deref()).await?;
-                    cli_client::print_status(&data);
+                    if output_json {
+                        println!("{}", serde_json::to_string_pretty(&data)?);
+                    } else {
+                        cli_client::print_status(&data);
+                    }
                     return Ok(());
                 }
                 CliCommand::List => {
-                    cli_client::list(&cfg).await?;
+                    let output_json = ctx.output_format == OutputFormat::Json;
+                    let data = cli_client::list(&cfg, output_json).await?;
+                    if output_json {
+                        println!("{}", serde_json::to_string_pretty(&data)?);
+                    }
                     return Ok(());
                 }
-                CliCommand::Index { dir } => cli_client::index(&cfg, &dir).await?,
+                CliCommand::Index { dir } => {
+                    cli_client::index(&cfg, &dir, ctx.dry_run, ctx.output_format == OutputFormat::Json).await?
+                }
                 CliCommand::Graph { pack: _ } => {
                     cli_client::graph_show(&cfg).await?;
                     return Ok(());
                 }
                 CliCommand::Query { query, mode, top_k, raw, pack } => {
                     let out = cli_client::query(&cfg, &QueryArgs { query, mode, top_k, raw }, pack.as_deref()).await?;
-                    if !raw {
+                    let use_formatted = !raw && ctx.output_format != OutputFormat::Json;
+                    if use_formatted {
                         if let (Some(answer), Some(sources)) = (
                             out.get("answer").and_then(serde_json::Value::as_str),
                             out.get("sources").and_then(serde_json::Value::as_array),
@@ -394,13 +697,13 @@ async fn main() -> Result<()> {
                     }
                     out
                 }
-                CliCommand::Help | CliCommand::Serve(_) | CliCommand::Remove { .. } => unreachable!(),
+                CliCommand::Help | CliCommand::Serve(_) | CliCommand::Remove { .. } | CliCommand::Schema { .. } => unreachable!(),
             };
             let json_str = serde_json::to_string_pretty(&out)?;
-            let output = if crate::term::color_stdout() {
-                to_colored_json_auto(&out).unwrap_or(json_str.clone())
-            } else {
+            let output = if ctx.output_format == OutputFormat::Json || !crate::term::color_stdout() {
                 json_str
+            } else {
+                to_colored_json_auto(&out).unwrap_or(json_str.clone())
             };
             println!("{}", output);
         }

@@ -184,59 +184,71 @@ pub fn print_status(data: &Value) {
     }
 }
 
-pub async fn list(cfg: &ServerConfig) -> Result<Value> {
+pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
     let reg = crate::registry::load_registry().unwrap_or_default();
     if reg.packs.is_empty() {
         let data = status(cfg, None).await?;
-        let pack_path = data
-            .get("pack_path")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let sources = data.get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
-        let jobs = data.get("jobs").and_then(Value::as_object);
-        let active_job = jobs.and_then(|j| j.get("active")).map(|v| !v.is_null()).unwrap_or(false);
+        if !output_json {
+            let pack_path = data
+                .get("pack_path")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let sources = data.get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
+            let jobs = data.get("jobs").and_then(Value::as_object);
+            let active_job = jobs.and_then(|j| j.get("active")).map(|v| !v.is_null()).unwrap_or(false);
 
-        if term::color_stdout() {
-            println!("{} [local] [cloud]", pack_path.bold());
-            for s in sources.iter().take(10) {
-                let path = s.get("root_path").and_then(Value::as_str).unwrap_or("?");
-                println!("  {}", path.dimmed());
-            }
-            if active_job {
-                println!("{}", "  (indexing...)".yellow());
-            }
-        } else {
-            println!("{} [local] [cloud]", pack_path);
-            for s in sources.iter().take(10) {
-                let path = s.get("root_path").and_then(Value::as_str).unwrap_or("?");
-                println!("  {}", path);
-            }
-            if active_job {
-                println!("  (indexing...)");
+            if term::color_stdout() {
+                println!("{} [local] [cloud]", pack_path.bold());
+                for s in sources.iter().take(10) {
+                    let path = s.get("root_path").and_then(Value::as_str).unwrap_or("?");
+                    println!("  {}", path.dimmed());
+                }
+                if active_job {
+                    println!("{}", "  (indexing...)".yellow());
+                }
+            } else {
+                println!("{} [local] [cloud]", pack_path);
+                for s in sources.iter().take(10) {
+                    let path = s.get("root_path").and_then(Value::as_str).unwrap_or("?");
+                    println!("  {}", path);
+                }
+                if active_job {
+                    println!("  (indexing...)");
+                }
             }
         }
         return Ok(data);
     }
 
-    for p in &reg.packs {
-        let default_marker = if p.default { " (default)" } else { "" };
-        if term::color_stdout() {
-            let cloud = if p.cloud { format!("{}", "[cloud]".cyan()) } else { format!("{}", "cloud".dimmed()) };
-            println!(
-                "{} [local] {} {}",
-                p.path.bold(),
-                cloud,
-                default_marker.dimmed()
-            );
-        } else {
-            let cloud = if p.cloud { "[cloud]" } else { "cloud" };
-            println!("{} [local] {} {}", p.path, cloud, default_marker);
+    if !output_json {
+        for p in &reg.packs {
+            let default_marker = if p.default { " (default)" } else { "" };
+            if term::color_stdout() {
+                let cloud = if p.cloud { format!("{}", "[cloud]".cyan()) } else { format!("{}", "cloud".dimmed()) };
+                println!(
+                    "{} [local] {} {}",
+                    p.path.bold(),
+                    cloud,
+                    default_marker.dimmed()
+                );
+            } else {
+                let cloud = if p.cloud { "[cloud]" } else { "cloud" };
+                println!("{} [local] {} {}", p.path, cloud, default_marker);
+            }
         }
     }
     Ok(json!({"packs": reg.packs}))
 }
 
-pub async fn index(cfg: &ServerConfig, path: &str) -> Result<Value> {
+pub async fn index(cfg: &ServerConfig, path: &str, dry_run: bool, output_json: bool) -> Result<Value> {
+    if dry_run {
+        return Ok(json!({
+            "dry_run": true,
+            "would": "index",
+            "path": path,
+            "status": "skipped"
+        }));
+    }
     let client = http_client()?;
     let url = format!("{}/index", cfg.base_url());
     let resp = client.post(url).json(&json!({"path": path})).send().await?;
@@ -246,17 +258,19 @@ pub async fn index(cfg: &ServerConfig, path: &str) -> Result<Value> {
         return Err(anyhow!("index request failed: {}", body));
     }
     let out: Value = serde_json::from_str(&body)?;
-    if let Some(job) = out.get("job").and_then(|j| j.get("id")).and_then(Value::as_str) {
-        if term::color_stdout() {
-            println!(
-                "{} {} ({}). Run 'mk status {}' to check progress.",
-                "Indexing".green(),
-                path,
-                job,
-                path
-            );
-        } else {
-            println!("Indexing {} ({}). Run 'mk status {}' to check progress.", path, job, path);
+    if !output_json {
+        if let Some(job) = out.get("job").and_then(|j| j.get("id")).and_then(Value::as_str) {
+            if term::color_stdout() {
+                println!(
+                    "{} {} ({}). Run 'mk status {}' to check progress.",
+                    "Indexing".green(),
+                    path,
+                    job,
+                    path
+                );
+            } else {
+                println!("Indexing {} ({}). Run 'mk status {}' to check progress.", path, job, path);
+            }
         }
     }
     Ok(out)
