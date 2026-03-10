@@ -14,6 +14,7 @@ mod ontology_llama;
 mod pack;
 mod query;
 mod query_synth;
+mod rerank;
 mod server;
 mod types;
 
