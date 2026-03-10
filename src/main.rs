@@ -99,8 +99,8 @@ enum CliCommand {
     Graph { pack: Option<String> },
     Query {
         query: String,
-        mode: String,
         top_k: usize,
+        use_reranker: bool,
         raw: bool,
         pack: Option<String>,
     },
@@ -341,15 +341,12 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
                     .map(String::from)
                     .ok_or_else(|| anyhow!("--json must include \"query\""))?;
                 crate::validate::reject_control_chars(&query)?;
-                let mode = j
-                    .get("mode")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("hybrid")
-                    .to_string();
                 let top_k = j
                     .get("top_k")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(8) as usize;
+                let use_reranker =
+                    j.get("use_reranker").and_then(serde_json::Value::as_bool).unwrap_or(true);
                 let raw = j.get("raw").and_then(serde_json::Value::as_bool).unwrap_or(false);
                 let pack = j.get("pack").and_then(serde_json::Value::as_str).map(String::from);
                 if let Some(ref p) = pack {
@@ -357,32 +354,29 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
                 }
                 return Ok(CliCommand::Query {
                     query,
-                    mode,
                     top_k,
+                    use_reranker,
                     raw,
                     pack,
                 });
             }
             if rest.is_empty() {
                 return Err(anyhow!(
-                    "usage: mk query <text> [--mode hybrid|vector] [--top-k N] [--pack <dir>] [--raw] or mk query --json '{{\"query\":\"...\"}}'"
+                    "usage: mk query <text> [--top-k N] [--no-rerank] [--pack <dir>] [--raw] or mk query --json '{{\"query\":\"...\"}}'"
                 ));
             }
             let query = rest[0].clone();
             crate::validate::reject_control_chars(&query)?;
-            let mut mode = "hybrid".to_string();
             let mut top_k = 8usize;
+            let mut use_reranker = true;
             let mut raw = false;
             let mut pack = None;
             let mut i = 1usize;
             while i < rest.len() {
                 match rest[i].as_str() {
-                    "--mode" => {
+                    "--no-rerank" => {
+                        use_reranker = false;
                         i += 1;
-                        mode = rest
-                            .get(i)
-                            .cloned()
-                            .ok_or_else(|| anyhow!("missing value for --mode"))?;
                     }
                     "--top-k" => {
                         i += 1;
@@ -405,8 +399,8 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
             }
             Ok(CliCommand::Query {
                 query,
-                mode,
                 top_k,
+                use_reranker,
                 raw,
                 pack,
             })
@@ -481,8 +475,8 @@ fn schema_for_command(cmd: &str) -> Option<serde_json::Value> {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language query"},
-                    "mode": {"type": "string", "enum": ["vector", "hybrid"], "default": "hybrid"},
                     "top_k": {"type": "integer", "default": 8},
+                    "use_reranker": {"type": "boolean", "default": true},
                     "raw": {"type": "boolean", "default": false},
                     "pack": {"type": "string", "description": "Pack directory (optional)"}
                 },
@@ -537,7 +531,7 @@ fn print_help() {
         "  mk list",
         "  mk index <dir>",
         "  mk graph [--pack <dir>]",
-        "  mk query <text> [--mode hybrid|vector] [--top-k N] [--pack <dir>] [--raw]",
+        "  mk query <text> [--top-k N] [--no-rerank] [--pack <dir>] [--raw]",
         "  mk schema [command]",
     ];
     for cmd in commands {
@@ -669,8 +663,8 @@ async fn main() -> Result<()> {
                     cli_client::graph_show(&cfg).await?;
                     return Ok(());
                 }
-                CliCommand::Query { query, mode, top_k, raw, pack } => {
-                    let out = cli_client::query(&cfg, &QueryArgs { query, mode, top_k, raw }, pack.as_deref()).await?;
+                CliCommand::Query { query, top_k, use_reranker, raw, pack } => {
+                    let out = cli_client::query(&cfg, &QueryArgs { query, top_k, use_reranker, raw }, pack.as_deref()).await?;
                     let use_formatted = !raw && ctx.output_format != OutputFormat::Json;
                     if use_formatted {
                         if let (Some(answer), Some(sources)) = (

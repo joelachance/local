@@ -31,8 +31,8 @@ impl ServerConfig {
 #[derive(Clone)]
 pub struct QueryArgs {
     pub query: String,
-    pub mode: String,
     pub top_k: usize,
+    pub use_reranker: bool,
     pub raw: bool,
 }
 
@@ -281,8 +281,8 @@ pub async fn query(cfg: &ServerConfig, args: &QueryArgs, pack: Option<&str>) -> 
     let url = format!("{}/query", cfg.base_url());
     let mut body = json!({
         "query": args.query,
-        "mode": args.mode,
         "top_k": args.top_k,
+        "use_reranker": args.use_reranker,
         "raw": args.raw
     });
     if let Some(p) = pack {

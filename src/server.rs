@@ -101,10 +101,10 @@ impl JobRegistry {
 #[derive(Deserialize)]
 struct QueryRequest {
     query: String,
-    #[serde(default = "default_mode")]
-    mode: String,
     #[serde(default = "default_top_k")]
     top_k: usize,
+    #[serde(default = "default_use_reranker")]
+    use_reranker: bool,
     #[serde(default)]
     raw: bool,
     pack: Option<String>,
@@ -129,12 +129,12 @@ struct SubgraphRequest {
     limit: usize,
 }
 
-fn default_mode() -> String {
-    "hybrid".to_string()
-}
-
 fn default_top_k() -> usize {
     8
+}
+
+fn default_use_reranker() -> bool {
+    true
 }
 
 fn default_depth() -> usize {
@@ -447,12 +447,12 @@ async fn query(
         } else {
             None
         };
-        run_query(&pack, &req.query, &req.mode, req.top_k, graph_name.as_deref())
+        run_query(&pack, &req.query, req.top_k, req.use_reranker, graph_name.as_deref())
     } else if state.packs.len() > 1 {
-        run_query_multi(&state.packs, &req.query, &req.mode, req.top_k)
+        run_query_multi(&state.packs, &req.query, req.top_k, req.use_reranker)
     } else {
         let pack = state.packs.first().unwrap();
-        run_query(pack, &req.query, &req.mode, req.top_k, None)
+        run_query(pack, &req.query, req.top_k, req.use_reranker, None)
     };
 
     match resp_result {
@@ -694,8 +694,8 @@ async fn mcp(
                 {"name":"memory_query","description":"Query local memory pack","inputSchema":{
                     "type":"object","properties":{
                         "query":{"type":"string"},
-                        "mode":{"type":"string","enum":["vector","hybrid"]},
-                        "top_k":{"type":"number"}
+                        "top_k":{"type":"number"},
+                        "use_reranker":{"type":"boolean"}
                     },
                     "required":["query"]
                 }},
@@ -722,18 +722,14 @@ async fn mcp(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let mode = args
-                        .get("mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("hybrid")
-                        .to_string();
                     let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(8) as usize;
+                    let use_reranker = args.get("use_reranker").and_then(Value::as_bool).unwrap_or(true);
 
                     let resp = if state.packs.len() > 1 {
-                        run_query_multi(&state.packs, &query, &mode, top_k)
+                        run_query_multi(&state.packs, &query, top_k, use_reranker)
                     } else {
                         let p = state.packs.first().unwrap();
-                        run_query(p, &query, &mode, top_k, None)
+                        run_query(p, &query, top_k, use_reranker, None)
                     };
                     match resp {
                         Ok(r) => json!({
