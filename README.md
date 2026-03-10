@@ -51,12 +51,14 @@ Agent-friendly flags: `--json` (input), `--output json`, `--dry-run`. See [CONTE
 - `API_PORT` (default `4242`)
 - `MEMKIT_PACK_PATH` (default `./memory-pack` when using serve)
 - `MEMKIT_PACK_PATHS` — Comma-delimited pack paths for multi-pack mode (overrides `MEMKIT_PACK_PATH` when set)
-- `MEMKIT_ONTOLOGY_PROVIDER` (`llama` default; `rules` or `candle` optional)
-- `MEMKIT_ONTOLOGY_MODEL` (GGUF model path for query synthesis)
-- `MEMKIT_ONTOLOGY_MAX_TOKENS` (default `512`)
-- `MEMKIT_ONTOLOGY_TIMEOUT_MS` (default `20000`)
+- `MEMKIT_LLM_PROVIDER` (`llama` default; `rules` or `candle` optional)
+- `MEMKIT_LLM_MODEL` (GGUF model path for ontology extraction and query synthesis)
+- `MEMKIT_LLM_MAX_TOKENS` (default `512`)
+- `MEMKIT_LLM_TIMEOUT_MS` (default `20000`)
 
-For query synthesis, run `./scripts/model-fetch.sh` once to download a GGUF model, or set `MEMKIT_ONTOLOGY_MODEL` to your own path.
+`MEMKIT_ONTOLOGY_*` env vars are deprecated aliases; use `MEMKIT_LLM_*` instead.
+
+For query synthesis, run `./scripts/model-fetch.sh` once to download a GGUF model, or set `MEMKIT_LLM_MODEL` to your own path.
 
 ## Docker
 
