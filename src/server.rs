@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::falkor_store::{
-    graph_counts as falkor_graph_counts, graph_name_from_env,
+    graph_counts as falkor_graph_counts, graph_name_for_pack, graph_name_from_env,
     graph_schema as falkor_graph_schema, graph_subgraph as falkor_graph_subgraph,
 };
 use crate::indexer::run_index;
@@ -23,12 +23,12 @@ use crate::pack::{init_pack, load_index, load_manifest, save_manifest};
 use crate::memkit_txt::ensure_memkit_txt;
 use crate::registry::{pack_dir_for_path, ensure_registered};
 use crate::types::SourceConfig;
-use crate::query::run_query;
+use crate::query::{run_query, run_query_multi};
 use crate::query_synth::synthesize_answer;
 
 #[derive(Clone)]
 struct AppState {
-    pack: Arc<PathBuf>,
+    packs: Arc<Vec<PathBuf>>,
     falkordb_socket: Option<String>,
     falkor_graph: String,
     jobs: Arc<Mutex<JobRegistry>>,
@@ -153,13 +153,16 @@ struct HealthResponse {
 }
 
 pub async fn run_server(
-    pack: PathBuf,
+    packs: Vec<PathBuf>,
     host: String,
     port: u16,
     falkordb_socket: Option<String>,
 ) -> Result<()> {
+    if packs.is_empty() {
+        anyhow::bail!("at least one pack path required");
+    }
     let state = AppState {
-        pack: Arc::new(pack),
+        packs: Arc::new(packs),
         falkordb_socket,
         falkor_graph: graph_name_from_env(),
         jobs: Arc::new(Mutex::new(JobRegistry::new())),
@@ -217,43 +220,63 @@ async fn status(
     State(state): State<AppState>,
     Query(q): Query<StatusQuery>,
 ) -> Json<Value> {
-    let pack = if let Some(ref path) = q.path {
+    let (pack_str, sources, vector_count, indexed, file_paths) = if let Some(ref path) = q.path {
         let dir = PathBuf::from(path)
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(path));
-        if dir.join(".memkit/manifest.json").exists() {
+        let pack = if dir.join(".memkit/manifest.json").exists() {
             dir.join(".memkit")
         } else if dir.join("manifest.json").exists() {
             dir
         } else {
-            state.pack.as_ref().clone()
-        }
+            state.packs.first().cloned().unwrap_or_else(|| dir)
+        };
+        let manifest = load_manifest(&pack).ok();
+        let index = load_index(&pack).ok();
+        let vector_count = index.as_ref().map(|i| i.docs.len()).unwrap_or(0);
+        let indexed = vector_count > 0;
+        let file_paths: Vec<String> = index
+            .as_ref()
+            .map(|i| i.docs.iter().map(|d| d.source_path.clone()).collect())
+            .unwrap_or_default();
+        let sources = manifest.map(|m| m.sources).unwrap_or_default();
+        (pack.display().to_string(), sources, vector_count, indexed, file_paths)
     } else {
-        state.pack.as_ref().clone()
+        let mut all_sources = Vec::new();
+        let mut all_paths = Vec::new();
+        let mut total_vectors = 0usize;
+        for pack in state.packs.iter() {
+            if let Ok(m) = load_manifest(pack) {
+                all_sources.extend(m.sources);
+            }
+            if let Ok(idx) = load_index(pack) {
+                total_vectors += idx.docs.len();
+                all_paths.extend(idx.docs.iter().map(|d| d.source_path.clone()));
+            }
+        }
+        let pack_str = if state.packs.len() == 1 {
+            state.packs[0].display().to_string()
+        } else {
+            format!("{} packs", state.packs.len())
+        };
+        (pack_str, all_sources, total_vectors, total_vectors > 0, all_paths)
     };
-
-    let manifest = load_manifest(&pack).ok();
-    let index = load_index(&pack).ok();
-    let vector_count = index.as_ref().map(|i| i.docs.len()).unwrap_or(0);
-    let indexed = vector_count > 0;
-    let file_paths: Vec<String> = index
-        .as_ref()
-        .map(|i| i.docs.iter().map(|d| d.source_path.clone()).collect())
-        .unwrap_or_default();
 
     let (entities, relationships) = state
         .falkordb_socket
         .as_ref()
         .and_then(|sock| falkor_graph_counts(sock, &state.falkor_graph).ok())
         .unwrap_or((0, 0));
-
-    let pack_str = pack.display().to_string();
-    let base_path = pack
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| *n == ".memkit")
-        .and_then(|_| pack.parent())
-        .map(|p| p.display().to_string())
+    let base_path = state
+        .packs
+        .first()
+        .and_then(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| *n == ".memkit")
+                .and_then(|_| p.parent())
+                .map(|pa| pa.display().to_string())
+        })
         .unwrap_or_else(|| pack_str.clone());
     let file_tree = format_file_tree(&file_paths, &base_path);
 
@@ -272,15 +295,17 @@ async fn status(
         (active, last, jobs.queue.len())
     };
 
+    let pack_paths: Vec<String> = state.packs.iter().map(|p| p.display().to_string()).collect();
     Json(json!({
         "status": "ok",
         "pack_path": pack_str,
+        "pack_paths": pack_paths,
         "indexed": indexed,
         "vector_count": vector_count,
         "entities": entities,
         "relationships": relationships,
         "file_tree": file_tree,
-        "sources": manifest.map(|m| m.sources).unwrap_or_default(),
+        "sources": sources,
         "jobs": {
             "active": active_job,
             "last_completed": last_job,
@@ -408,20 +433,29 @@ async fn query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let pack = if let Some(ref path) = req.pack {
+    let resp_result = if let Some(ref path) = req.pack {
         let dir = PathBuf::from(path);
-        if dir.join(".memkit/manifest.json").exists() {
+        let pack = if dir.join(".memkit/manifest.json").exists() {
             dir.join(".memkit")
         } else if dir.join("manifest.json").exists() {
             dir
         } else {
-            state.pack.as_ref().clone()
-        }
+            state.packs.first().cloned().unwrap_or_else(|| dir)
+        };
+        let graph_name = if state.packs.len() > 1 {
+            graph_name_for_pack(&pack).ok()
+        } else {
+            None
+        };
+        run_query(&pack, &req.query, &req.mode, req.top_k, graph_name.as_deref())
+    } else if state.packs.len() > 1 {
+        run_query_multi(&state.packs, &req.query, &req.mode, req.top_k)
     } else {
-        state.pack.as_ref().clone()
+        let pack = state.packs.first().unwrap();
+        run_query(pack, &req.query, &req.mode, req.top_k, None)
     };
 
-    match run_query(&pack, &req.query, &req.mode, req.top_k) {
+    match resp_result {
         Ok(resp) => {
             if req.raw {
                 Ok(Json(json!(resp)))
@@ -570,7 +604,7 @@ async fn enqueue_index_job(state: &AppState, trigger: &str, pack_path: Option<St
 
 fn start_next_job_if_idle(state: AppState) {
     tokio::spawn(async move {
-        let (maybe_job_id, pack_to_use) = {
+        let (maybe_job_id, packs_to_index) = {
             let mut jobs = state.jobs.lock().await;
             if jobs.running.is_some() {
                 return;
@@ -584,24 +618,39 @@ fn start_next_job_if_idle(state: AppState) {
                 job.state = JobState::Running;
                 job.started_at = Some(Utc::now());
             }
-            let pack = pack_path
-                .map(PathBuf::from)
-                .unwrap_or_else(|| (*state.pack).clone());
-            (id, pack)
+            let packs: Vec<PathBuf> = pack_path
+                .map(|p| vec![PathBuf::from(p)])
+                .unwrap_or_else(|| state.packs.iter().cloned().collect());
+            (id, packs)
         };
 
         let run_outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-            let manifest = load_manifest(&pack_to_use)?;
-            let sources: Vec<PathBuf> = manifest
-                .sources
-                .iter()
-                .map(|s| PathBuf::from(&s.root_path))
-                .collect();
-            let (scanned, updated, chunks) = run_index(&pack_to_use, &sources)?;
+            let mut total_scanned = 0usize;
+            let mut total_updated = 0usize;
+            let mut total_chunks = 0usize;
+            let multi = packs_to_index.len() > 1;
+            for pack in &packs_to_index {
+                let manifest = load_manifest(pack)?;
+                let sources: Vec<PathBuf> = manifest
+                    .sources
+                    .iter()
+                    .map(|s| PathBuf::from(&s.root_path))
+                    .collect();
+                let graph_name = if multi {
+                    graph_name_for_pack(pack).ok()
+                } else {
+                    None
+                };
+                let (scanned, updated, chunks) =
+                    run_index(pack, &sources, graph_name.as_deref())?;
+                total_scanned += scanned;
+                total_updated += updated;
+                total_chunks += chunks;
+            }
             Ok(json!({
-                "scanned": scanned,
-                "updated_files": updated,
-                "chunks": chunks
+                "scanned": total_scanned,
+                "updated_files": total_updated,
+                "chunks": total_chunks
             }))
         })
         .await;
@@ -680,7 +729,13 @@ async fn mcp(
                         .to_string();
                     let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(8) as usize;
 
-                    match run_query(&state.pack, &query, &mode, top_k) {
+                    let resp = if state.packs.len() > 1 {
+                        run_query_multi(&state.packs, &query, &mode, top_k)
+                    } else {
+                        let p = state.packs.first().unwrap();
+                        run_query(p, &query, &mode, top_k, None)
+                    };
+                    match resp {
                         Ok(r) => json!({
                             "content":[{"type":"text","text":json!({
                                 "mode": r.mode,
@@ -695,14 +750,23 @@ async fn mcp(
                     }
                 }
                 "memory_status" => json!({
-                    "content":[{"type":"text","text":json!({"status":"ok","pack_path":state.pack.display().to_string()}).to_string()}]
+                    "content":[{"type":"text","text":json!({
+                        "status":"ok",
+                        "pack_path": state.packs.first().map(|p| p.display().to_string()).unwrap_or_default(),
+                        "pack_paths": state.packs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+                    }).to_string()}]
                 }),
-                "memory_sources" => json!({
-                    "content":[{"type":"text","text":match load_manifest(&state.pack) {
-                        Ok(m) => json!({"sources":m.sources}).to_string(),
-                        Err(_) => json!({"sources":[]}).to_string(),
-                    }}]
-                }),
+                "memory_sources" => {
+                    let mut all_sources = Vec::new();
+                    for pack in state.packs.iter() {
+                        if let Ok(m) = load_manifest(pack) {
+                            all_sources.extend(m.sources);
+                        }
+                    }
+                    json!({
+                        "content":[{"type":"text","text":json!({"sources":all_sources}).to_string()}]
+                    })
+                }
                 _ => json!({"isError": true, "content":[{"type":"text","text":"unknown tool"}]}),
             }
         }

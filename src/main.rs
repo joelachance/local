@@ -25,12 +25,10 @@ use colored_json::to_colored_json_auto;
 use owo_colors::OwoColorize;
 
 use crate::cli_client::{ServerConfig, QueryArgs};
-use crate::indexer::run_index;
-use crate::pack::load_manifest;
 use crate::server::run_server;
 
 struct ServeConfig {
-    pack: PathBuf,
+    packs: Vec<PathBuf>,
     host: String,
     port: u16,
 }
@@ -51,19 +49,31 @@ enum CliCommand {
     Help,
 }
 
+fn parse_pack_paths(value: &str) -> Vec<PathBuf> {
+    value
+        .split(',')
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
 fn parse_serve(args: &[String]) -> Result<Option<ServeConfig>> {
     let is_serve = args.first().map(|a| a == "serve" || a == "--headless-serve").unwrap_or(false);
     if !is_serve {
         return Ok(None);
     }
 
-    let mut pack = PathBuf::from(
-        env::var("MEMKIT_PACK_PATH")
-            .or_else(|_| env::var("MEMORY_PACK_PATH"))
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "./memory-pack".to_string()),
-    );
+    let mut packs: Vec<PathBuf> = env::var("MEMKIT_PACK_PATHS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| parse_pack_paths(&v))
+        .or_else(|| {
+            env::var("MEMKIT_PACK_PATH")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| vec![PathBuf::from(v)])
+        })
+        .unwrap_or_else(|| vec![PathBuf::from("./memory-pack")]);
     let mut host = "127.0.0.1".to_string();
     let mut port = 4242u16;
 
@@ -75,7 +85,7 @@ fn parse_serve(args: &[String]) -> Result<Option<ServeConfig>> {
                 let v = args
                     .get(i)
                     .ok_or_else(|| anyhow!("missing value for --pack"))?;
-                pack = PathBuf::from(v);
+                packs = parse_pack_paths(v);
             }
             "--host" => {
                 i += 1;
@@ -100,7 +110,10 @@ fn parse_serve(args: &[String]) -> Result<Option<ServeConfig>> {
         i += 1;
     }
 
-    Ok(Some(ServeConfig { pack, host, port }))
+    if packs.is_empty() {
+        return Err(anyhow!("at least one pack path required"));
+    }
+    Ok(Some(ServeConfig { packs, host, port }))
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
@@ -226,7 +239,7 @@ async fn main() -> Result<()> {
     match parse_cli_command(&args)? {
         CliCommand::Help => print_help(),
         CliCommand::Serve(cfg) => {
-            serve_with_startup(cfg.pack, cfg.host, cfg.port).await?;
+            serve_with_startup(cfg.packs, cfg.host, cfg.port).await?;
         }
         cmd => {
             let cfg = ServerConfig::from_env();
@@ -293,53 +306,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn serve_with_startup(pack: PathBuf, host: String, port: u16) -> Result<()> {
-    let manifest = load_manifest(&pack).ok();
-    let sources: Vec<PathBuf> = manifest
-        .as_ref()
-        .map(|m| m.sources.iter().map(|s| PathBuf::from(&s.root_path)).collect())
-        .unwrap_or_default();
+pub(crate) async fn serve_with_startup(packs: Vec<PathBuf>, host: String, port: u16) -> Result<()> {
     let color = crate::term::color_stdout();
-    if !sources.is_empty() {
-        let (scanned, updated, chunks) = run_index(&pack, &sources)?;
-        if color {
-            println!(
-                "{} scanned={} updated_files={} chunks={}",
-                "startup index complete:".green(),
-                scanned.to_string().cyan(),
-                updated.to_string().cyan(),
-                chunks.to_string().cyan()
-            );
-        } else {
-            println!(
-                "startup index complete: scanned={} updated_files={} chunks={}",
-                scanned, updated, chunks
-            );
-        }
-    } else {
-        if color {
-            println!("{}", "startup index skipped: no sources configured in manifest".yellow());
-        } else {
-            println!("startup index skipped: no sources configured in manifest");
-        }
-    }
     let port = env::var("API_PORT")
         .ok()
         .and_then(|p| u16::from_str(&p).ok())
         .unwrap_or(port);
     let falkordb_socket = env::var("FALKORDB_SOCKET").ok();
     if color {
+        let pack_display = if packs.len() == 1 {
+            packs[0].display().to_string()
+        } else {
+            format!("{} packs", packs.len())
+        };
         println!(
             "{} {} {} {}:{}",
             "serving pack".cyan(),
-            pack.display().to_string().bold(),
+            pack_display.bold(),
             "on".cyan(),
             host.cyan(),
             port.to_string().cyan()
         );
     } else {
-        println!("serving pack {} on {}:{}", pack.display(), host, port);
+        if packs.len() == 1 {
+            println!("serving pack {} on {}:{}", packs[0].display(), host, port);
+        } else {
+            println!("serving {} packs on {}:{}", packs.len(), host, port);
+        }
     }
-    run_server(pack, host, port, falkordb_socket).await?;
+    run_server(packs, host, port, falkordb_socket).await?;
     Ok(())
 }
