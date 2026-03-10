@@ -20,11 +20,13 @@ use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use colored_json::to_colored_json_auto;
 use owo_colors::OwoColorize;
 
 use crate::cli_client::{ServerConfig, QueryArgs};
+use crate::pack::{copy_file_to_pack, scrub_pack_from_dir};
+use crate::registry::{load_registry, pack_dir_for_path};
 use crate::server::run_server;
 
 struct ServeConfig {
@@ -35,6 +37,8 @@ struct ServeConfig {
 
 enum CliCommand {
     Serve(ServeConfig),
+    Add { path: String, pack: Option<String> },
+    Remove { dir: Option<String> },
     Status { dir: Option<String> },
     List,
     Index { dir: String },
@@ -47,6 +51,35 @@ enum CliCommand {
         pack: Option<String>,
     },
     Help,
+}
+
+fn resolve_pack_root(pack_arg: Option<&str>) -> Result<PathBuf> {
+    if let Some(p) = pack_arg {
+        let path = PathBuf::from(p)
+            .canonicalize()
+            .with_context(|| format!("pack path not found: {}", p))?;
+        if path.join(".memkit/manifest.json").exists() {
+            return Ok(path);
+        }
+        if path.join("manifest.json").exists() {
+            return Ok(path);
+        }
+        anyhow::bail!("no memory pack at {}", path.display());
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if cwd.join(".memkit/manifest.json").exists() {
+        return Ok(cwd);
+    }
+    let reg = load_registry().unwrap_or_default();
+    if let Some(ref default) = reg.default_path {
+        return Ok(PathBuf::from(default));
+    }
+    if let Some(p) = reg.packs.first() {
+        return Ok(PathBuf::from(&p.path));
+    }
+    anyhow::bail!(
+        "no memory pack found. use --pack <dir> or run `mk index <dir>` first"
+    )
 }
 
 fn parse_pack_paths(value: &str) -> Vec<PathBuf> {
@@ -126,6 +159,27 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
     }
 
     match args[0].as_str() {
+        "add" => {
+            let path = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("usage: mk add <path> [--pack <dir>]"))?;
+            let mut pack = None;
+            let mut i = 2usize;
+            while i < args.len() {
+                if args[i] == "--pack" && args.get(i + 1).is_some() {
+                    pack = args.get(i + 1).cloned();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(CliCommand::Add { path, pack })
+        }
+        "remove" => {
+            let dir = args.get(1).cloned();
+            Ok(CliCommand::Remove { dir })
+        }
         "status" => {
             let dir = args.get(1).cloned();
             Ok(CliCommand::Status { dir })
@@ -217,6 +271,8 @@ fn print_help() {
     println!("{}", usage);
     let commands = [
         "  mk serve [--pack <path>] [--host <host>] [--port <port>]",
+        "  mk add <path> [--pack <dir>]",
+        "  mk remove [dir]",
         "  mk status [dir]",
         "  mk list",
         "  mk index <dir>",
@@ -243,8 +299,55 @@ async fn main() -> Result<()> {
         }
         cmd => {
             let cfg = ServerConfig::from_env();
+
+            match &cmd {
+                CliCommand::Remove { dir } => {
+                    let target = dir
+                        .as_deref()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                    let target = target
+                        .canonicalize()
+                        .with_context(|| format!("path not found: {}", target.display()))?;
+                    scrub_pack_from_dir(&target)?;
+                    if crate::term::color_stdout() {
+                        println!("{} scrubbed from {}", "Memory pack removed".green(), target.display());
+                    } else {
+                        println!("Memory pack removed from {}", target.display());
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+
             cli_client::ensure_server(&cfg).await?;
             let out = match cmd {
+                CliCommand::Add { path, pack } => {
+                    let source = PathBuf::from(&path)
+                        .canonicalize()
+                        .with_context(|| format!("file not found: {}", path))?;
+                    let pack_root = resolve_pack_root(pack.as_deref())?;
+                    let pack_dir = pack_dir_for_path(&pack_root);
+                    if !pack_dir.join("manifest.json").exists() {
+                        anyhow::bail!(
+                            "no memory pack at {}. run `mk index {}` first",
+                            pack_root.display(),
+                            pack_root.display()
+                        );
+                    }
+                    let dest = copy_file_to_pack(&source, &pack_root)?;
+                    if crate::term::color_stdout() {
+                        println!(
+                            "{} {} -> {}",
+                            "Copied".green(),
+                            source.display(),
+                            dest.display()
+                        );
+                    } else {
+                        println!("Copied {} -> {}", source.display(), dest.display());
+                    }
+                    cli_client::index(&cfg, pack_root.to_string_lossy().as_ref()).await?
+                }
                 CliCommand::Status { dir } => {
                     if dir.is_none() {
                         cli_client::list(&cfg).await?;
@@ -291,7 +394,7 @@ async fn main() -> Result<()> {
                     }
                     out
                 }
-                CliCommand::Help | CliCommand::Serve(_) => unreachable!(),
+                CliCommand::Help | CliCommand::Serve(_) | CliCommand::Remove { .. } => unreachable!(),
             };
             let json_str = serde_json::to_string_pretty(&out)?;
             let output = if crate::term::color_stdout() {
