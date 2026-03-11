@@ -84,7 +84,9 @@ use colored_json::to_colored_json_auto;
 use owo_colors::OwoColorize;
 
 use crate::cli_client::{ServerConfig, QueryArgs};
-use crate::pack::{copy_file_to_pack, scrub_pack_from_dir};
+use crate::pack::{
+    add_source_root, copy_dir_into_sources, copy_file_into_sources, scrub_pack_from_dir,
+};
 use crate::registry::{load_registry, pack_dir_for_path};
 use crate::server::run_server;
 
@@ -646,7 +648,7 @@ async fn main() -> Result<()> {
                     }
                     let source = PathBuf::from(&path)
                         .canonicalize()
-                        .with_context(|| format!("file not found: {}", path))?;
+                        .with_context(|| format!("path not found: {}", path))?;
                     let pack_root = resolve_pack_root(pack.as_deref())?;
                     let pack_dir = pack_dir_for_path(&pack_root);
                     if !pack_dir.join("manifest.json").exists() {
@@ -656,7 +658,18 @@ async fn main() -> Result<()> {
                             pack_root.display()
                         );
                     }
-                    let dest = copy_file_to_pack(&source, &pack_root)?;
+                    let (dest, pack_relative) = if source.is_dir() {
+                        let name = source
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "unnamed".to_string());
+                        let d = copy_dir_into_sources(&source, &pack_dir, &name)?;
+                        (d, format!("sources/{}", name))
+                    } else {
+                        let d = copy_file_into_sources(&source, &pack_dir)?;
+                        (d, "sources/_files".to_string())
+                    };
+                    add_source_root(&pack_dir, &pack_relative)?;
                     if crate::term::color_stdout() {
                         println!(
                             "{} {} -> {}",
