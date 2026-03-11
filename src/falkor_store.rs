@@ -233,6 +233,7 @@ pub fn query_chunks(
     graph_name: &str,
     query: &str,
     top_k: usize,
+    path_filter: Option<&str>,
 ) -> Result<Vec<QueryHit>> {
     let terms = tokenize_query(query);
     if terms.is_empty() {
@@ -244,9 +245,14 @@ pub fn query_chunks(
         .map(|t| format!("toLower(e.name) CONTAINS '{}'", escape_cypher(t)))
         .collect::<Vec<_>>()
         .join(" OR ");
+    let path_cond = path_filter.map(|pf| {
+        let escaped = escape_cypher(&pf.replace('\\', "/"));
+        format!(" AND toLower(c.file_path) CONTAINS toLower('{escaped}')")
+    });
+    let path_cond = path_cond.as_deref().unwrap_or("");
     let cypher = format!(
         "MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) \
-         WHERE {where_clause} \
+         WHERE {where_clause}{path_cond} \
          RETURN c.id, c.file_path, c.chunk_index, c.content, count(e) \
          ORDER BY count(e) DESC \
          LIMIT {}",

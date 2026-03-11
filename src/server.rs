@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::add_docs::run_add;
 use crate::falkor_store::{
     graph_counts as falkor_graph_counts, graph_name_for_pack, graph_name_from_env,
     graph_schema as falkor_graph_schema, graph_subgraph as falkor_graph_subgraph,
@@ -108,6 +109,8 @@ struct QueryRequest {
     #[serde(default)]
     raw: bool,
     pack: Option<String>,
+    #[serde(default)]
+    path_filter: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -118,6 +121,25 @@ struct StatusQuery {
 #[derive(Deserialize, Default)]
 struct IndexRequest {
     path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AddDocumentItem {
+    #[serde(rename = "type")]
+    doc_type: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct AddConversationMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize, Default)]
+struct AddRequest {
+    documents: Option<Vec<AddDocumentItem>>,
+    conversation: Option<Vec<AddConversationMessage>>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +198,7 @@ pub async fn run_server(
         .route("/graph/view", get(graph_view))
         .route("/query", post(query))
         .route("/index", post(index_now))
+        .route("/add", post(add_now))
         .route("/mcp", post(mcp))
         .with_state(state);
 
@@ -447,12 +470,32 @@ async fn query(
         } else {
             None
         };
-        run_query(&pack, &req.query, req.top_k, req.use_reranker, graph_name.as_deref())
+        run_query(
+            &pack,
+            &req.query,
+            req.top_k,
+            req.use_reranker,
+            graph_name.as_deref(),
+            req.path_filter.as_deref(),
+        )
     } else if state.packs.len() > 1 {
-        run_query_multi(&state.packs, &req.query, req.top_k, req.use_reranker)
+        run_query_multi(
+            &state.packs,
+            &req.query,
+            req.top_k,
+            req.use_reranker,
+            req.path_filter.as_deref(),
+        )
     } else {
         let pack = state.packs.first().unwrap();
-        run_query(pack, &req.query, req.top_k, req.use_reranker, None)
+        run_query(
+            pack,
+            &req.query,
+            req.top_k,
+            req.use_reranker,
+            None,
+            req.path_filter.as_deref(),
+        )
     };
 
     match resp_result {
@@ -676,6 +719,106 @@ fn start_next_job_if_idle(state: AppState) {
     });
 }
 
+async fn add_now(
+    State(state): State<AppState>,
+    Json(req): Json<AddRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pack = state.packs.first().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":"NO_PACK","message":"no pack configured"}})),
+        )
+    })?;
+
+    let mut contents: Vec<String> = Vec::new();
+
+    if let Some(docs) = &req.documents {
+        for item in docs {
+            let content = match item.doc_type.as_str() {
+                "url" => {
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error":{"code":"HTTP_CLIENT","message":e.to_string()}})),
+                            )
+                        })?;
+                    let resp = client.get(&item.value).send().await.map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":{"code":"FETCH_FAILED","message":e.to_string()}})),
+                        )
+                    })?;
+                    resp.text().await.map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":{"code":"FETCH_FAILED","message":e.to_string()}})),
+                        )
+                    })?
+                }
+                "content" => item.value.clone(),
+                _ => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error":{"code":"INVALID_TYPE","message":"document type must be url or content"}})),
+                    ));
+                }
+            };
+            contents.push(content);
+        }
+    }
+
+    if let Some(conv) = &req.conversation {
+        let text: String = conv
+            .iter()
+            .map(|m| format!("{}: {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        contents.push(text);
+    }
+
+    if contents.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":"EMPTY_ADD","message":"documents or conversation required"}})),
+        ));
+    }
+
+    let run_result = tokio::task::spawn_blocking({
+        let pack = pack.clone();
+        let contents = contents;
+        move || -> anyhow::Result<Value> {
+            let mut total_chunks = 0usize;
+            for content in &contents {
+                let source_path = format!("memkit://add/{}", chrono::Utc::now().timestamp_millis());
+                let chunks = run_add(&pack, content, &source_path)?;
+                total_chunks += chunks;
+            }
+            Ok(json!({
+                "status": "ok",
+                "chunks_added": total_chunks
+            }))
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":{"code":"ADD_FAILED","message":e.to_string()}})),
+        )
+    })?;
+
+    match run_result {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":"ADD_FAILED","message":e.to_string()}})),
+        )),
+    }
+}
+
 async fn mcp(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
@@ -726,10 +869,10 @@ async fn mcp(
                     let use_reranker = args.get("use_reranker").and_then(Value::as_bool).unwrap_or(true);
 
                     let resp = if state.packs.len() > 1 {
-                        run_query_multi(&state.packs, &query, top_k, use_reranker)
+                        run_query_multi(&state.packs, &query, top_k, use_reranker, None)
                     } else {
                         let p = state.packs.first().unwrap();
-                        run_query(p, &query, top_k, use_reranker, None)
+                        run_query(p, &query, top_k, use_reranker, None, None)
                     };
                     match resp {
                         Ok(r) => json!({

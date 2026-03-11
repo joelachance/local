@@ -41,6 +41,7 @@ pub fn run_query(
     top_k: usize,
     use_reranker: bool,
     graph_name_override: Option<&str>,
+    path_filter: Option<&str>,
 ) -> Result<QueryResponse> {
     let total_start = Instant::now();
     let manifest = load_manifest(pack_dir)?;
@@ -79,20 +80,34 @@ pub fn run_query(
         .map(String::from)
         .unwrap_or_else(graph_name_from_env);
     let top_for_backend = top_k.saturating_mul(2);
+    let path_filter_lance = path_filter.map(String::from);
+    let path_filter_falkor = path_filter.map(String::from);
     let (mut lancedb_hits, falkor_hits) = std::thread::scope(|scope| {
         let lance = scope.spawn(|| {
-            hybrid_query(&pack_path, &query_text, &query_embedding, top_for_backend)
-                .unwrap_or_default()
+            hybrid_query(
+                &pack_path,
+                &query_text,
+                &query_embedding,
+                top_for_backend,
+                path_filter_lance.as_deref(),
+            )
+            .unwrap_or_default()
         });
         let graph = scope.spawn(|| {
             if let Some(socket_path) = falkor_socket {
-                query_falkor_chunks(&socket_path, &graph_name, &query_text, top_for_backend)
-                    .unwrap_or_else(|err| {
-                        crate::term::warn(format!(
-                            "warning: falkor query failed, continuing with lancedb: {err}"
-                        ));
-                        Vec::new()
-                    })
+                query_falkor_chunks(
+                    &socket_path,
+                    &graph_name,
+                    &query_text,
+                    top_for_backend,
+                    path_filter_falkor.as_deref(),
+                )
+                .unwrap_or_else(|err| {
+                    crate::term::warn(format!(
+                        "warning: falkor query failed, continuing with lancedb: {err}"
+                    ));
+                    Vec::new()
+                })
             } else {
                 Vec::new()
             }
@@ -108,8 +123,14 @@ pub fn run_query(
     let index_docs = index.docs;
 
     if lancedb_hits.is_empty() && falkor_hits.is_empty() {
-        lancedb_hits = index_docs
-            .iter()
+        let docs = index_docs.iter().filter(|d| {
+            path_filter.map_or(true, |pf| {
+                let p = d.source_path.replace('\\', "/");
+                let pf_norm = pf.replace('\\', "/");
+                p.contains(&pf_norm)
+            })
+        });
+        lancedb_hits = docs
             .map(|d| {
                 let vec = cosine(&q_embedding, &d.embedding);
                 QueryHit {
@@ -261,25 +282,35 @@ pub fn run_query_multi(
     q: &str,
     top_k: usize,
     use_reranker: bool,
+    path_filter: Option<&str>,
 ) -> Result<QueryResponse> {
     if packs.is_empty() {
         return Err(anyhow::anyhow!("at least one pack required"));
     }
     if packs.len() == 1 {
-        return run_query(&packs[0], q, top_k, use_reranker, None);
+        return run_query(&packs[0], q, top_k, use_reranker, None, path_filter);
     }
 
     let total_start = Instant::now();
     let top_for_backend = top_k.saturating_mul(2);
+    let path_filter_owned = path_filter.map(String::from);
     let results: Vec<QueryResponse> = std::thread::scope(|scope| {
         let handles: Vec<_> = packs
             .iter()
             .map(|pack| {
                 let pack = pack.clone();
                 let q = q.to_string();
+                let pf = path_filter_owned.clone();
                 scope.spawn(move || {
                     let graph_name = graph_name_for_pack(&pack).ok();
-                    run_query(&pack, &q, top_for_backend, use_reranker, graph_name.as_deref())
+                    run_query(
+                        &pack,
+                        &q,
+                        top_for_backend,
+                        use_reranker,
+                        graph_name.as_deref(),
+                        pf.as_deref(),
+                    )
                 })
             })
             .collect();

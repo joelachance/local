@@ -174,11 +174,18 @@ fn parse_hits_from_batches(
     Ok(hits)
 }
 
+fn path_matches_filter(file_path: &str, path_filter: &str) -> bool {
+    let p = file_path.replace('\\', "/");
+    let f = path_filter.replace('\\', "/");
+    p.contains(&f)
+}
+
 pub fn hybrid_query(
     pack_dir: &Path,
     query: &str,
     query_embedding: &[f32],
     top_k: usize,
+    path_filter: Option<&str>,
 ) -> Result<Vec<QueryHit>> {
     let db_path = db_dir(pack_dir);
     if !db_path.exists() {
@@ -186,6 +193,7 @@ pub fn hybrid_query(
     }
     let q = query.to_string();
     let vecq = query_embedding.to_vec();
+    let path_filter_owned = path_filter.map(String::from);
 
     let task = async move {
         let uri = db_path.to_string_lossy().to_string();
@@ -244,8 +252,12 @@ pub fn hybrid_query(
         rt.block_on(task)?
     };
 
-    let vec_list = parse_hits_from_batches(&vec_hits, 0.0, "lancedb_vector")?;
-    let fts_list = parse_hits_from_batches(&fts_hits, 0.0, "lancedb_fts")?;
+    let mut vec_list = parse_hits_from_batches(&vec_hits, 0.0, "lancedb_vector")?;
+    let mut fts_list = parse_hits_from_batches(&fts_hits, 0.0, "lancedb_fts")?;
+    if let Some(ref pf) = path_filter_owned {
+        vec_list.retain(|h| path_matches_filter(&h.file_path, pf));
+        fts_list.retain(|h| path_matches_filter(&h.file_path, pf));
+    }
 
     // Reciprocal rank fusion over two ranked lists.
     let mut by_id: HashMap<String, QueryHit> = HashMap::new();
@@ -274,6 +286,78 @@ pub fn hybrid_query(
     });
     out.truncate(top_k);
     Ok(out)
+}
+
+pub fn append_docs(
+    pack_dir: &Path,
+    docs: &[SourceDoc],
+    embedding_dim: usize,
+) -> Result<()> {
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let db_path = db_dir(pack_dir);
+    let task = async move {
+        let uri = db_path.to_string_lossy().to_string();
+        let db = lancedb::connect(&uri)
+            .execute()
+            .await
+            .context("failed to connect lancedb")?;
+
+        let table = db
+            .open_table(TABLE_NAME)
+            .execute()
+            .await
+            .context("failed to open chunks table")?;
+
+        let schema = make_schema(embedding_dim);
+        let chunk_id = StringArray::from_iter_values(docs.iter().map(|d| d.chunk_id.clone()));
+        let source_path = StringArray::from_iter_values(docs.iter().map(|d| d.source_path.clone()));
+        let chunk_index = UInt32Array::from_iter_values(docs.iter().map(|d| d.chunk_index as u32));
+        let start_offset = Int64Array::from_iter_values(docs.iter().map(|d| d.start_offset as i64));
+        let end_offset = Int64Array::from_iter_values(docs.iter().map(|d| d.end_offset as i64));
+        let content = StringArray::from_iter_values(docs.iter().map(|d| d.content.clone()));
+        let content_hash =
+            StringArray::from_iter_values(docs.iter().map(|d| d.content_hash.clone()));
+        let embedding = arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            docs.iter()
+                .map(|d| Some(d.embedding.iter().copied().map(Some).collect::<Vec<_>>())),
+            embedding_dim as i32,
+        );
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(chunk_id),
+                Arc::new(source_path),
+                Arc::new(chunk_index),
+                Arc::new(start_offset),
+                Arc::new(end_offset),
+                Arc::new(content),
+                Arc::new(content_hash),
+                Arc::new(embedding),
+            ],
+        )?;
+
+        table.add(Box::new(RecordBatchIterator::new(
+            vec![Ok(batch)].into_iter(),
+            schema,
+        )))
+        .execute()
+        .await
+        .context("failed to append to chunks table")?;
+
+        Ok::<_, anyhow::Error>(())
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task))?;
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(task)?;
+    }
+    Ok(())
 }
 
 pub fn ensure_chunk_ids(docs: &mut [SourceDoc]) {
