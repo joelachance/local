@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memkit-sdk"
+version = "0.1.0"
+description = "SDK for memkit memory packs"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.25",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["memkit_sdk"]
