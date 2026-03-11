@@ -5,10 +5,14 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::embed::provider_from_name;
+use crate::falkor_store::{
+    graph_name_for_pack, socket_from_env, upsert_chunks, ChunkGraphPayload,
+};
 use crate::indexer::{chunk_text, content_hash};
 use crate::lancedb_store::{append_docs, ensure_chunk_ids, rebuild_tables};
-use crate::pack::{load_index, load_manifest, save_index};
-use crate::types::{SourceDoc};
+use crate::ontology::OntologyEngine;
+use crate::pack::load_manifest;
+use crate::types::SourceDoc;
 
 fn to_chunk_id(source_path: &str, content_hash: &str, chunk_index: usize) -> String {
     let mut h = Sha256::new();
@@ -24,7 +28,6 @@ pub fn run_add(
     source_path: &str,
 ) -> Result<usize> {
     let manifest = load_manifest(pack_dir)?;
-    let mut index = load_index(pack_dir)?;
 
     let mut provider = provider_from_name(
         &manifest.embedding.provider,
@@ -80,22 +83,38 @@ pub fn run_add(
         return Ok(0);
     }
 
-    let new_count = new_docs.len();
+    ensure_chunk_ids(&mut new_docs);
+
     let db_path = pack_dir.join("lancedb");
     let dim = manifest.embedding.dimension;
-
-    index.docs.append(&mut new_docs);
-    ensure_chunk_ids(&mut index.docs);
-
-    save_index(pack_dir, &index).context("failed to persist index")?;
-
     if db_path.exists() {
-        let start = index.docs.len() - new_count;
-        append_docs(pack_dir, &index.docs[start..], dim)
-            .context("failed to append to lancedb")?;
+        append_docs(pack_dir, &new_docs, dim).context("failed to append to lancedb")?;
     } else {
-        rebuild_tables(pack_dir, &index.docs, dim)
-            .context("failed to rebuild lancedb tables")?;
+        rebuild_tables(pack_dir, &new_docs, dim).context("failed to rebuild lancedb tables")?;
+    }
+
+    if let Some(socket_path) = socket_from_env() {
+        if let Ok(graph_name) = graph_name_for_pack(pack_dir) {
+            let mut ontology = OntologyEngine::new(pack_dir)?;
+            let graph_chunks: Vec<ChunkGraphPayload> = new_docs
+                .iter()
+                .map(|doc| {
+                    let extraction = ontology.extract(&doc.content_hash, &doc.content, 12);
+                    ChunkGraphPayload {
+                        chunk_id: doc.chunk_id.clone(),
+                        file_path: doc.source_path.clone(),
+                        chunk_index: doc.chunk_index,
+                        content_hash: doc.content_hash.clone(),
+                        content: doc.content.clone(),
+                        entities: extraction.entities,
+                        relations: extraction.relations,
+                    }
+                })
+                .collect();
+            if let Err(e) = upsert_chunks(&socket_path, &graph_name, &graph_chunks) {
+                crate::term::warn(format!("warning: failed writing add chunks to falkor: {e}"));
+            }
+        }
     }
 
     Ok(new_docs.len())
