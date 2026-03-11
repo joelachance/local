@@ -13,7 +13,7 @@ memkit is a local memory pack—it indexes text files for semantic search and gr
 
 ## How it works
 
-memkit reads supported extensions (md, txt, rs, ts, js, json, etc.), chunks, embeds, and stores data in `.memkit/`.
+memkit reads supported extensions (md, txt, rs, ts, js, json, doc, docx, xls, xlsx, etc.), chunks, embeds, and stores data in `.memkit/`.
 
 ## This directory
 
@@ -21,7 +21,7 @@ memkit reads supported extensions (md, txt, rs, ts, js, json, etc.), chunks, emb
 
 ## Notes
 
-- memkit only reads recognized text files
+- memkit only reads recognized files
 - Do not modify files memkit doesn't index
 - `.memkit/` is internal—do not edit
 "#;
