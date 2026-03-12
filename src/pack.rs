@@ -77,7 +77,7 @@ pub fn load_manifest_from_loc(loc: &PackLocation) -> Result<Manifest> {
     Ok(manifest)
 }
 
-pub fn save_manifest(pack_dir: &Path, mut manifest: Manifest) -> Result<()> {
+pub fn save_manifest(pack_dir: &Path, manifest: Manifest) -> Result<()> {
     save_manifest_to_loc(&PackLocation::local(pack_dir), manifest)
 }
 
@@ -191,21 +191,6 @@ pub fn resolve_source_roots(pack_dir: &Path, manifest: &Manifest) -> Vec<PathBuf
         })
         .filter(|p| p.exists())
         .collect()
-}
-
-/// Copies a file into the pack root and returns the destination path.
-/// Preserves the file name; overwrites if destination exists.
-/// Prefer copy_file_into_sources for the canonical layout (sources/).
-pub fn copy_file_to_pack(source: &Path, pack_root: &Path) -> Result<PathBuf> {
-    if !source.is_file() {
-        bail!("not a file: {}", source.display());
-    }
-    let name = source
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("invalid source path"))?;
-    let dest = pack_root.join(name);
-    fs::copy(source, &dest).context("failed to copy file")?;
-    Ok(dest)
 }
 
 /// Memkit artifacts to remove when scrubbing. Covers both .memkit layout and legacy root layout.

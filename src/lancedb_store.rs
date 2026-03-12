@@ -418,21 +418,6 @@ pub fn hybrid_query_with_uri(
     Ok(out)
 }
 
-pub fn hybrid_query(
-    pack_dir: &Path,
-    query: &str,
-    query_embedding: &[f32],
-    top_k: usize,
-    path_filter: Option<&str>,
-) -> Result<Vec<QueryHit>> {
-    let db_path = db_dir(pack_dir);
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
-    let uri = db_path.to_string_lossy().to_string();
-    hybrid_query_with_uri(&uri, None, query, query_embedding, top_k, path_filter)
-}
-
 /// Append docs to the chunks table at the given URI. Use storage_options for S3.
 pub fn append_docs_with_uri(
     uri: &str,

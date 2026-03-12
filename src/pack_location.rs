@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
-use walkdir::WalkDir;
 
 /// Run async code from sync context (for S3 operations).
 fn block_on_async<F, Fut, T>(f: F) -> T
@@ -31,7 +30,6 @@ pub enum PackLocation {
     S3 {
         bucket: String,
         prefix: String,
-        region: Option<String>,
         /// Storage options for LanceDB (e.g. region, credentials). Keys/values passed to ConnectBuilder.
         storage_options: Vec<(String, String)>,
     },
@@ -69,14 +67,8 @@ impl PackLocation {
         Ok(PackLocation::S3 {
             bucket,
             prefix,
-            region,
             storage_options,
         })
-    }
-
-    /// True if this is a local path.
-    pub fn is_local(&self) -> bool {
-        matches!(self, PackLocation::Local(_))
     }
 
     /// Path for local; None for S3.
@@ -129,52 +121,6 @@ impl PackLocation {
         }
     }
 
-    /// List relative paths under a prefix (e.g. "sources/" or ""). Returns paths relative to pack root.
-    pub fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        match self {
-            PackLocation::Local(root) => {
-                let base = root.join(prefix);
-                if !base.exists() {
-                    return Ok(Vec::new());
-                }
-                let mut out = Vec::new();
-                for entry in WalkDir::new(&base)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.file_type().is_file())
-                {
-                    let p = entry.path();
-                    if let Ok(rel) = p.strip_prefix(root) {
-                        out.push(rel.to_string_lossy().replace('\\', "/"));
-                    }
-                }
-                Ok(out)
-            }
-            PackLocation::S3 {
-                bucket,
-                prefix: base_prefix,
-                ..
-            } => {
-                let list_prefix = if base_prefix.is_empty() {
-                    prefix.to_string()
-                } else if prefix.is_empty() {
-                    base_prefix.clone()
-                } else {
-                    format!(
-                        "{}/{}",
-                        base_prefix.trim_end_matches('/'),
-                        prefix.trim_end_matches('/')
-                    )
-                };
-                let bucket = bucket.clone();
-                let base_prefix = base_prefix.clone();
-                block_on_async(move || async move {
-                    list_s3_prefix(&bucket, &list_prefix, &base_prefix).await
-                })
-            }
-        }
-    }
-
     /// URI for the LanceDB database (directory/prefix that contains the lance tables).
     pub fn lancedb_uri(&self) -> String {
         match self {
@@ -206,7 +152,7 @@ impl PackLocation {
 
 // S3 helpers (async); we block_on when called from sync code.
 async fn read_s3_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
-    let config = aws_config::load_from_env().await;
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = Client::new(&config);
     let resp = client
         .get_object()
@@ -220,7 +166,7 @@ async fn read_s3_object(bucket: &str, key: &str) -> Result<Vec<u8>> {
 }
 
 async fn write_s3_object(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
-    let config = aws_config::load_from_env().await;
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = Client::new(&config);
     let body = ByteStream::from(data.to_vec());
     client
@@ -234,36 +180,3 @@ async fn write_s3_object(bucket: &str, key: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn list_s3_prefix(bucket: &str, prefix: &str, base_prefix: &str) -> Result<Vec<String>> {
-    let config = aws_config::load_from_env().await;
-    let client = Client::new(&config);
-    let mut out = Vec::new();
-    let mut continuation = None;
-    let strip = if base_prefix.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", base_prefix.trim_end_matches('/'))
-    };
-    loop {
-        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
-        if let Some(ref token) = continuation {
-            req = req.continuation_token(token);
-        }
-        let resp = req.send().await.context("S3 ListObjectsV2 failed")?;
-        for obj in resp.contents().iter().filter_map(|o| o.key()) {
-            let rel = if strip.is_empty() {
-                obj.to_string()
-            } else if let Some(rest) = obj.strip_prefix(&strip) {
-                rest.to_string()
-            } else {
-                obj.to_string()
-            };
-            out.push(rel);
-        }
-        continuation = resp.next_continuation_token().map(String::from);
-        if continuation.is_none() {
-            break;
-        }
-    }
-    Ok(out)
-}

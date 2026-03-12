@@ -56,12 +56,6 @@ pub struct OntologyArtifact {
     pub relations: Vec<OntologyRelation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OntologySourceCandidate {
-    pub source_path: String,
-    pub artifact_path: PathBuf,
-}
-
 pub trait OntologyProvider {
     fn provider_name(&self) -> &'static str;
     fn model_name(&self) -> String;
@@ -313,67 +307,6 @@ impl OntologyEngine {
         Ok(artifact_path)
     }
 
-    pub fn list_artifacts(pack_dir: &Path) -> Result<Vec<PathBuf>> {
-        let dir = pack_dir.join("ontology");
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        for entry in fs::read_dir(dir).context("failed reading ontology directory")? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                out.push(path);
-            }
-        }
-        out.sort();
-        Ok(out)
-    }
-
-    pub fn source_candidates(pack_dir: &Path) -> Result<Vec<OntologySourceCandidate>> {
-        let mut out = Vec::new();
-        for artifact_path in Self::list_artifacts(pack_dir)? {
-            if let Ok(artifact) = Self::read_artifact(&artifact_path) {
-                out.push(OntologySourceCandidate {
-                    source_path: artifact.source_path,
-                    artifact_path,
-                });
-            }
-        }
-        out.sort_by(|a, b| a.source_path.cmp(&b.source_path));
-        Ok(out)
-    }
-
-    pub fn filter_candidates_by_prefix(
-        candidates: &[OntologySourceCandidate],
-        prefix: &str,
-    ) -> Vec<OntologySourceCandidate> {
-        candidates
-            .iter()
-            .filter(|c| c.source_path.starts_with(prefix))
-            .cloned()
-            .collect()
-    }
-
-    pub fn read_artifact(path: &Path) -> Result<OntologyArtifact> {
-        let bytes = fs::read(path).context("failed to read ontology artifact")?;
-        serde_json::from_slice::<OntologyArtifact>(&bytes).context("invalid ontology artifact")
-    }
-
-    pub fn find_artifact_for_source(pack_dir: &Path, source_path: &str) -> Result<Option<PathBuf>> {
-        let mut h = Sha256::new();
-        h.update(source_path.as_bytes());
-        let source_hash = format!("{:x}", h.finalize());
-        let path = pack_dir
-            .join("ontology")
-            .join(format!("{}.ontology.json", &source_hash[..16]));
-        if path.exists() {
-            Ok(Some(path))
-        } else {
-            Ok(None)
-        }
-    }
-
 }
 
 fn extract_entities(content: &str, max_entities: usize) -> Vec<String> {
@@ -467,13 +400,6 @@ mod tests {
             )
             .expect("artifact should be written");
         assert!(out.exists());
-        let found = OntologyEngine::find_artifact_for_source(&pack_dir, "/tmp/demo-source")
-            .expect("lookup should succeed");
-        assert!(found.is_some());
-        let candidates = OntologyEngine::source_candidates(&pack_dir).expect("should list candidates");
-        assert_eq!(candidates.len(), 1);
-        let filtered = OntologyEngine::filter_candidates_by_prefix(&candidates, "/tmp");
-        assert_eq!(filtered.len(), 1);
 
         let _ = fs::remove_dir_all(pack_dir);
     }

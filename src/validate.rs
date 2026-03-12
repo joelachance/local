@@ -1,7 +1,7 @@
 //! Input hardening for agent-invoked CLI. Rejects adversarial inputs that agents
 //! may hallucinate: path traversal, embedded query params, control chars, etc.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 
@@ -12,20 +12,6 @@ pub fn reject_control_chars(s: &str) -> Result<()> {
             return Err(anyhow!(
                 "invalid input: control character (U+{:04X}) not allowed",
                 c as u32
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validates resource IDs (job IDs, etc.). Rejects `?`, `#`, `%` and control chars.
-pub fn validate_resource_id(s: &str) -> Result<()> {
-    reject_control_chars(s)?;
-    for c in s.chars() {
-        if c == '?' || c == '#' || c == '%' {
-            return Err(anyhow!(
-                "invalid resource id: '{}' not allowed (possible embedded query or encoding)",
-                c
             ));
         }
     }
@@ -48,20 +34,3 @@ pub fn validate_path(s: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
-/// Validates that a path does not escape the given root when canonicalized.
-pub fn validate_path_within_root(path: &Path, root: &Path) -> Result<PathBuf> {
-    let canonical = path.canonicalize().map_err(|e| {
-        anyhow!("path not found or invalid: {} ({})", path.display(), e)
-    })?;
-    let root_canonical = root.canonicalize().map_err(|e| {
-        anyhow!("root path not found: {} ({})", root.display(), e)
-    })?;
-    if !canonical.starts_with(&root_canonical) {
-        return Err(anyhow!(
-            "path {} escapes root {}",
-            canonical.display(),
-            root_canonical.display()
-        ));
-    }
-    Ok(canonical)
-}
