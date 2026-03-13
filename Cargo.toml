@@ -20,7 +20,7 @@ store-helix-only = ["helix"]
 [dependencies]
 anyhow = "1"
 # Helix: crates.io 1.0.115 has build errors; use git main until a fix is published
-helix-db = { git = "https://github.com/HelixDB/helix-db.git", optional = true }
+helix-db = { git = "https://github.com/HelixDB/helix-db.git", optional = true, features = ["compiler"] }
 bumpalo = { version = "3", optional = true }
 heed3 = { version = "0.22", optional = true }
 aws-config = "1.4"
@@ -32,6 +32,7 @@ arrow-schema = "57"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
+dotenvy = "0.15"
 fastembed = "5"
 futures-util = "0.3"
 glob = "0.3"

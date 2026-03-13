@@ -694,6 +694,7 @@ fn print_help() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, ctx) = parse_global_flags(&args);
 
