@@ -8,11 +8,21 @@ name = "mk"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["lance-falkor"]
 llama-embedded = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# Lance + Falkor backend (default)
+lance-falkor = ["dep:lancedb", "dep:lance-index", "dep:redis"]
+# Helix backend (one LMDB per pack)
+helix = ["dep:helix-db", "dep:bumpalo", "dep:heed3"]
+# Helix-only build: no Lance/Falkor. Use: cargo build --release --no-default-features --features helix,store-helix-only
+store-helix-only = ["helix"]
 
 [dependencies]
 anyhow = "1"
+# Helix: crates.io 1.0.115 has build errors; use git main until a fix is published
+helix-db = { git = "https://github.com/HelixDB/helix-db.git", optional = true }
+bumpalo = { version = "3", optional = true }
+heed3 = { version = "0.22", optional = true }
 aws-config = "1.4"
 aws-sdk-s3 = "1.54"
 colored_json = "5"
@@ -25,8 +35,8 @@ dirs = "6"
 fastembed = "5"
 futures-util = "0.3"
 glob = "0.3"
-lancedb = { version = "0.26", features = ["aws"] }
-lance-index = "2.0"
+lancedb = { version = "0.26", features = ["aws"], optional = true }
+lance-index = { version = "2.0", optional = true }
 litchi = "0.0.1"
 llama-cpp-2 = { version = "0.1.138", optional = true }
 notify = "8"
@@ -37,9 +47,12 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+petname = "2"
 walkdir = "2"
-redis = "1.0.4"
+redis = { version = "1.0.4", optional = true }
 opener = "0.8"
+pdf-extract = "0.10"
 yup-oauth2 = { version = "12", features = ["hyper-rustls"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
 hyper-rustls = "0.27"

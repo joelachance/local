@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 const REGISTRY_DIR: &str = ".memkit";
 const REGISTRY_FILE: &str = "registry.json";
@@ -10,6 +11,8 @@ const REGISTRY_FILE: &str = "registry.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryPack {
     pub path: String,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub default: bool,
     #[serde(default = "default_local")]
@@ -58,7 +61,30 @@ pub fn pack_dir_for_path(dir: &Path) -> PathBuf {
     dir.join(REGISTRY_DIR)
 }
 
-pub fn ensure_registered(path: &str, is_default: bool) -> Result<()> {
+fn random_pack_name() -> String {
+    petname::petname(1, "-").expect("petname generation")
+}
+
+fn unique_pack_name(reg: &Registry) -> String {
+    let existing: std::collections::HashSet<_> = reg
+        .packs
+        .iter()
+        .filter_map(|p| p.name.as_deref())
+        .collect();
+    loop {
+        let base = random_pack_name();
+        if !existing.contains(base.as_str()) {
+            return base;
+        }
+        let suffix = Uuid::new_v4().to_string().chars().take(4).collect::<String>();
+        let name = format!("{}-{}", base, suffix);
+        if !existing.contains(name.as_str()) {
+            return name;
+        }
+    }
+}
+
+pub fn ensure_registered(path: &str, name: Option<String>, is_default: bool) -> Result<()> {
     let mut reg = load_registry()?;
     let normalized = PathBuf::from(path)
         .canonicalize()
@@ -66,9 +92,33 @@ pub fn ensure_registered(path: &str, is_default: bool) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    if !reg.packs.iter().any(|p| p.path == normalized) {
+    let name = match name {
+        Some(n) => {
+            if let Some(existing) = reg.packs.iter().find(|p| p.name.as_deref() == Some(n.as_str())) {
+                if existing.path != normalized {
+                    return Err(anyhow!("pack name \"{}\" is already used by another pack at {}", n, existing.path));
+                }
+            }
+            Some(n)
+        }
+        None => Some(unique_pack_name(&reg)),
+    };
+
+    let existing_idx = reg.packs.iter().position(|p| p.path == normalized);
+    if let Some(idx) = existing_idx {
+        if is_default {
+            reg.default_path = Some(normalized.clone());
+            for p in &mut reg.packs {
+                p.default = p.path == normalized;
+            }
+        }
+        if let Some(ref n) = name {
+            reg.packs[idx].name = Some(n.clone());
+        }
+    } else {
         reg.packs.push(RegistryPack {
             path: normalized.clone(),
+            name,
             default: is_default,
             local: true,
             cloud: false,
@@ -76,13 +126,45 @@ pub fn ensure_registered(path: &str, is_default: bool) -> Result<()> {
         if is_default {
             reg.default_path = Some(normalized);
         }
-    } else if is_default {
-        reg.default_path = Some(normalized.clone());
-        for p in &mut reg.packs {
-            p.default = p.path == normalized;
-        }
     }
 
     save_registry(&reg)?;
     Ok(())
+}
+
+/// Set the default pack by name or path. Resolves the argument then updates registry default_path and default flags.
+pub fn set_default(name_or_path: &str) -> Result<()> {
+    let path = resolve_pack_by_name_or_path(name_or_path)?;
+    let normalized = path.to_string_lossy().to_string();
+    let mut reg = load_registry()?;
+    reg.default_path = Some(normalized.clone());
+    for p in &mut reg.packs {
+        p.default = p.path == normalized;
+    }
+    save_registry(&reg)?;
+    Ok(())
+}
+
+/// Resolve a pack by name (registry) or by path. Returns the directory that contains the pack (parent of .memkit or pack root).
+pub fn resolve_pack_by_name_or_path(arg: &str) -> Result<PathBuf> {
+    let reg = load_registry().unwrap_or_default();
+    if let Some(p) = reg.packs.iter().find(|p| p.name.as_deref() == Some(arg)) {
+        let path = PathBuf::from(&p.path)
+            .canonicalize()
+            .context("registry pack path no longer exists")?;
+        if path.join(".memkit/manifest.json").exists() || path.join("manifest.json").exists() {
+            return Ok(path);
+        }
+        anyhow::bail!("pack \"{}\" path {} has no manifest", arg, path.display());
+    }
+    let path = PathBuf::from(arg)
+        .canonicalize()
+        .with_context(|| format!("pack path not found: {}", arg))?;
+    if path.join(".memkit/manifest.json").exists() {
+        return Ok(path);
+    }
+    if path.join("manifest.json").exists() {
+        return Ok(path);
+    }
+    Err(anyhow::anyhow!("no memory pack at {}", path.display()))
 }

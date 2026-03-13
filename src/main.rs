@@ -671,6 +671,7 @@ fn print_help() {
     println!("  Global flags: [--output json|text] [--dry-run]");
     println!();
     let commands = [
+        "  mk --json '{\"command\":\"<cmd>\", ...}'",
         "  mk add <path> [--pack <name-or-path>]",
         "  mk remove [dir]",
         "  mk status [dir]",
