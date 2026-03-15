@@ -8,14 +8,13 @@ name = "mk"
 path = "src/main.rs"
 
 [features]
-default = ["lance-falkor"]
+default = ["store-helix-only", "llama-embedded"]
 llama-embedded = ["dep:llama-cpp-2", "dep:encoding_rs"]
-# Lance + Falkor backend (default)
-lance-falkor = ["dep:lancedb", "dep:lance-index", "dep:redis"]
-# Helix backend (one LMDB per pack)
+# Helix backend (vector + graph, one LMDB per pack)
 helix = ["dep:helix-db", "dep:bumpalo", "dep:heed3"]
-# Helix-only build: no Lance/Falkor. Use: cargo build --release --no-default-features --features helix,store-helix-only
 store-helix-only = ["helix"]
+# Lance + Falkor backend: cargo build --no-default-features --features lance-falkor
+lance-falkor = ["dep:lancedb", "dep:lance-index", "dep:redis"]
 
 [dependencies]
 anyhow = "1"
