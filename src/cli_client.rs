@@ -539,7 +539,13 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
                 let relationships = data.get("relationships").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let counts_suffix = format!("{} vectors, {} entities, {} relationships", vector_count, entities, relationships);
                 let active_obj = active_job.and_then(Value::as_object);
-                let status_line = if let Some(ref obj) = active_obj {
+                let is_remove_job_for_this_pack = active_obj.as_ref().and_then(|o| o.get("job_type").and_then(Value::as_str)) == Some("remove_pack")
+                    && active_obj.as_ref().and_then(|o| o.get("pack_path").and_then(Value::as_str)).map_or(false, |job_path| {
+                        job_path == p.path || p.path.strip_prefix(job_path).map_or(false, |s| s.is_empty() || s == "/.memkit")
+                    });
+                let status_line = if is_remove_job_for_this_pack {
+                    "removing...".to_string()
+                } else if let Some(ref obj) = active_obj {
                     let id = obj.get("id").and_then(Value::as_str).unwrap_or("?");
                     format!("indexing ({}) — {}", id, counts_suffix)
                 } else if indexed {
@@ -603,6 +609,19 @@ pub async fn index(cfg: &ServerConfig, path: &str, name: Option<&str>, dry_run: 
         }
     }
     Ok(out)
+}
+
+pub async fn remove(cfg: &ServerConfig, path: &str) -> Result<Value> {
+    let client = index_http_client()?;
+    let url = format!("{}/remove", cfg.base_url());
+    let body = json!({ "path": path });
+    let resp = client.post(url).json(&body).send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(anyhow!("remove request failed: {}", body));
+    }
+    Ok(serde_json::from_str(&body)?)
 }
 
 pub async fn query(cfg: &ServerConfig, args: &QueryArgs, pack: Option<&str>) -> Result<Value> {
