@@ -31,10 +31,7 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
-
 use anyhow::{Context, Result, anyhow};
-use indicatif::ProgressBar;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
@@ -91,11 +88,33 @@ use colored_json::to_colored_json_auto;
 use owo_colors::OwoColorize;
 
 use crate::cli_client::{ServerConfig, QueryArgs};
-use crate::pack::{
-    add_source_root, init_pack, scrub_pack_from_dir,
-};
-use crate::registry::{ensure_registered, load_registry, pack_dir_for_path, remove_pack_by_path, resolve_pack_by_name_or_path, set_default};
+use crate::pack::{add_source_root, init_pack};
+use crate::registry::{ensure_registered, load_registry, pack_dir_for_path, resolve_pack_by_name_or_path, set_default};
 use crate::server::run_server;
+
+/// For add responses, replace full "content" in job.add_payload.items with a short placeholder so stdout isn't flooded.
+fn trim_add_response_content(out: &serde_json::Value) -> serde_json::Value {
+    let mut v = out.clone();
+    if let Some(items) = v
+        .get_mut("job")
+        .and_then(|j| j.get_mut("add_payload"))
+        .and_then(|p| p.get_mut("items"))
+        .and_then(|a| a.as_array_mut())
+    {
+        for item in items {
+            if let Some(obj) = item.as_object_mut() {
+                if let Some(content) = obj.get("content").and_then(serde_json::Value::as_str) {
+                    let len = content.len();
+                    obj.insert(
+                        "content".to_string(),
+                        serde_json::Value::String(format!("({} characters)", len)),
+                    );
+                }
+            }
+        }
+    }
+    v
+}
 
 struct ServeConfig {
     packs: Vec<PathBuf>,
@@ -171,6 +190,12 @@ fn resolve_pack_root(pack_arg: Option<&str>) -> Result<PathBuf> {
     }
     if let Some(p) = reg.packs.first() {
         return Ok(PathBuf::from(&p.path));
+    }
+    if let Some(home) = dirs::home_dir() {
+        let pack_dir = pack_dir_for_path(&home);
+        if pack_dir.join("manifest.json").exists() {
+            return Ok(home);
+        }
     }
     anyhow::bail!(
         "no memory pack found. use --pack <name-or-path> or run `mk index <dir>` first"
@@ -796,27 +821,57 @@ fn print_help() {
     }
 }
 
+/// If dotenvy failed to set MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON (e.g. value has newlines), try loading
+/// it from .env manually: find MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON= and use the rest of the file as the value.
+/// Tries current_dir() first, then the executable's directory and parents (so a server spawned from
+/// another cwd still finds .env in the repo).
+fn load_memkit_google_json_from_dotenv_fallback() {
+    if std::env::var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON").is_ok() {
+        return;
+    }
+    const PREFIX: &str = "MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON=";
+
+    let try_env_file = |path: &std::path::Path| -> bool {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let idx = match content.find(PREFIX) {
+            Some(i) => i,
+            None => return false,
+        };
+        let value = content[idx + PREFIX.len()..].trim_end();
+        if value.starts_with('{') {
+            // SAFETY: single-threaded at startup; no other thread reads this var yet.
+            unsafe { std::env::set_var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON", value); }
+            true
+        } else {
+            false
+        }
+    };
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if try_env_file(&cwd.join(".env")) {
+            return;
+        }
+    }
+    let mut dir = match std::env::current_exe() {
+        Ok(exe) => exe.parent().map(|p| p.to_path_buf()),
+        Err(_) => None,
+    };
+    for _ in 0..10 {
+        let Some(d) = dir.as_ref() else { break };
+        if try_env_file(&d.join(".env")) {
+            return;
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    // #region agent log
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-085e7a.log") {
-        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into());
-        let data = serde_json::json!({
-            "sessionId": "085e7a",
-            "location": "main.rs:after dotenv",
-            "message": "env after dotenv",
-            "data": {
-                "memkit_json_set": std::env::var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON").is_ok(),
-                "google_creds_set": std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok(),
-                "cwd": cwd
-            },
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-            "hypothesisId": "H1 H2 H4"
-        });
-        let _ = writeln!(f, "{}", data.to_string());
-    }
-    // #endregion
+    load_memkit_google_json_from_dotenv_fallback();
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, ctx) = parse_global_flags(&args);
 
@@ -1014,7 +1069,20 @@ async fn main() -> Result<()> {
                             } else {
                                 println!("Added source {}", source.display());
                             }
-                            let out = cli_client::index(&effective_cfg, pack_root.to_string_lossy().as_ref(), None, false, ctx.output_format == OutputFormat::Json).await?;
+                            // Trigger index for this pack by path to the pack dir (never send pack root/home).
+                            let index_path = pack_dir
+                                .canonicalize()
+                                .unwrap_or_else(|_| pack_dir.clone())
+                                .to_string_lossy()
+                                .to_string();
+                            // #region agent log
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-14a764.log") {
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                                let _ = writeln!(f, "{}", serde_json::json!({"sessionId":"14a764","location":"main.rs:Add:index_path","message":"path sent to index","data":{"index_path":index_path,"pack_root":pack_root.to_string_lossy().to_string()},"timestamp":ts,"hypothesisId":"A"}));
+                                let _ = f.flush();
+                            }
+                            // #endregion
+                            let out = cli_client::index(&effective_cfg, &index_path, None, false, ctx.output_format == OutputFormat::Json).await?;
                             Ok(CommandOut::Output(out))
                         }
                     }
@@ -1112,16 +1180,17 @@ async fn main() -> Result<()> {
                         Ok(CommandOut::Output(out))
                     }
                 }
-                CliCommand::Help | CliCommand::Remove { .. } | CliCommand::Schema { .. } | CliCommand::Use { .. } => unreachable!(),
+                CliCommand::Help | CliCommand::Schema { .. } | CliCommand::Use { .. } => unreachable!(),
             };
             guard.shutdown()?;
             let command_out = result?;
             if let CommandOut::Output(out) = command_out {
-                let json_str = serde_json::to_string_pretty(&out)?;
+                let out_display = trim_add_response_content(&out);
+                let json_str = serde_json::to_string_pretty(&out_display)?;
                 let output = if ctx.output_format == OutputFormat::Json || !crate::term::color_stdout() {
                     json_str
                 } else {
-                    to_colored_json_auto(&out).unwrap_or(json_str.clone())
+                    to_colored_json_auto(&out_display).unwrap_or(json_str.clone())
                 };
                 println!("{}", output);
             }
