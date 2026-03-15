@@ -14,54 +14,10 @@ const SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets.readonl
 /// - GOOGLE_APPLICATION_CREDENTIALS: path to JSON key file
 /// - MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON: inline JSON string
 pub async fn load_service_account_key() -> Result<yup_oauth2::ServiceAccountKey> {
-    // #region agent log
-    let memkit_set = env::var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON").is_ok();
-    let google_creds_set = env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-085e7a.log") {
-        let data = serde_json::json!({
-            "sessionId": "085e7a",
-            "location": "google.rs:load_service_account_key entry",
-            "message": "which env vars set",
-            "data": { "memkit_set": memkit_set, "google_creds_set": google_creds_set },
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-            "hypothesisId": "H4"
-        });
-        let _ = std::io::Write::write_fmt(&mut f, format_args!("{}\n", data.to_string()));
-    }
-    // #endregion
     if let Ok(json) = env::var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON") {
         match yup_oauth2::parse_service_account_key(json.as_bytes()) {
-            Ok(key) => {
-                // #region agent log
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-085e7a.log") {
-                    let data = serde_json::json!({
-                        "sessionId": "085e7a",
-                        "location": "google.rs:parse MEMKIT",
-                        "message": "parse ok",
-                        "data": {},
-                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                        "hypothesisId": "H5"
-                    });
-                    let _ = std::io::Write::write_fmt(&mut f, format_args!("{}\n", data.to_string()));
-                }
-                // #endregion
-                return Ok(key);
-            }
+            Ok(key) => return Ok(key),
             Err(e) => {
-                // #region agent log
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-085e7a.log") {
-                    let err_msg = e.to_string();
-                    let data = serde_json::json!({
-                        "sessionId": "085e7a",
-                        "location": "google.rs:parse MEMKIT err",
-                        "message": "parse failed",
-                        "data": { "error": if err_msg.len() > 200 { format!("{}...", &err_msg[..200]) } else { err_msg } },
-                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                        "hypothesisId": "H5"
-                    });
-                    let _ = std::io::Write::write_fmt(&mut f, format_args!("{}\n", data.to_string()));
-                }
-                // #endregion
                 return Err(anyhow::Error::from(e).context("parse MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON"));
             }
         }
@@ -71,19 +27,6 @@ pub async fn load_service_account_key() -> Result<yup_oauth2::ServiceAccountKey>
             .await
             .context("read GOOGLE_APPLICATION_CREDENTIALS file");
     }
-    // #region agent log
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-085e7a.log") {
-        let data = serde_json::json!({
-            "sessionId": "085e7a",
-            "location": "google.rs:bail neither",
-            "message": "neither env set",
-            "data": {},
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-            "hypothesisId": "H4"
-        });
-        let _ = std::io::Write::write_fmt(&mut f, format_args!("{}\n", data.to_string()));
-    }
-    // #endregion
     anyhow::bail!(
         "Google integration not configured: set GOOGLE_APPLICATION_CREDENTIALS (path to JSON key) \
          or MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON (inline JSON)"
