@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
@@ -115,11 +116,73 @@ pub const SOURCES_DIR: &str = "sources";
 /// Subdir for single-file adds (one file -> sources/_files/<name>).
 const SOURCES_FILES_DIR: &str = "_files";
 
-/// Copies a directory tree into pack_dir/sources/<name>/ preserving layout. Creates sources/ if needed.
-pub fn copy_dir_into_sources(source_dir: &Path, pack_dir: &Path, name: &str) -> Result<PathBuf> {
+/// True if the path is under a directory that may contain iCloud/FileProvider cloud-only files (macOS).
+fn is_likely_icloud_path(path: &Path) -> bool {
+    path.to_string_lossy().contains("Library/Mobile Documents")
+        || path.to_string_lossy().contains("FileProvider")
+        || path.to_string_lossy().contains("iCloud")
+}
+
+/// On macOS, trigger download of cloud-only files: brctl for iCloud Drive, fileproviderctl for FileProvider.
+fn try_trigger_cloud_download(path: &Path) {
+    let s = path.to_string_lossy();
+    if s.contains("Library/Mobile Documents") {
+        let _ = Command::new("brctl").arg("download").arg(path).output();
+    } else if s.contains("FileProvider") {
+        let _ = Command::new("fileproviderctl").arg("materialize").arg(path).output();
+    }
+}
+
+/// Copy directory tree from src to dest (dest/rel for each file). Skips .memkit. Uses copy or read-then-write.
+fn copy_tree_into(src_dir: &Path, dest_dir: &Path) -> Result<()> {
+    for entry in WalkDir::new(src_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        let rel = path.strip_prefix(src_dir).context("strip prefix")?;
+        if rel.components().any(|c| c.as_os_str() == ".memkit") {
+            continue;
+        }
+        let dest = dest_dir.join(rel);
+        if let Some(p) = dest.parent() {
+            fs::create_dir_all(p).context("failed to create dest parent")?;
+        }
+        if fs::copy(path, &dest).is_err() {
+            let _ = fs::read(path).and_then(|c| fs::write(&dest, c));
+        }
+    }
+    Ok(())
+}
+
+/// Result of copying a directory for indexing. For iCloud, index from temp and clean up after.
+pub struct CopyDirOutcome {
+    /// Source root to add to manifest (pack-relative e.g. "sources/name", or absolute temp path for iCloud).
+    pub source_root: String,
+    /// If set, remove this path from manifest and delete it after indexing (iCloud temp dir).
+    pub cleanup_after_index: Option<PathBuf>,
+}
+
+/// Copies a directory tree for indexing. Creates sources/ if needed.
+/// For iCloud/FileProvider: downloads to /tmp, returns temp as source_root and cleanup_after_index; index runs from temp, then caller must remove that source and delete temp (no copy into pack).
+pub fn copy_dir_into_sources(source_dir: &Path, pack_dir: &Path, name: &str) -> Result<CopyDirOutcome> {
     if !source_dir.is_dir() {
         bail!("not a directory: {}", source_dir.display());
     }
+
+    if is_likely_icloud_path(source_dir) {
+        let temp = std::env::temp_dir().join(format!("memkit-icloud-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp).context("failed to create temp dir")?;
+        try_trigger_cloud_download(source_dir);
+        copy_tree_into(source_dir, &temp)?;
+        let path_str = temp.to_string_lossy().to_string();
+        return Ok(CopyDirOutcome {
+            source_root: path_str,
+            cleanup_after_index: Some(temp),
+        });
+    }
+
     let sources_base = pack_dir.join(SOURCES_DIR);
     fs::create_dir_all(&sources_base).context("failed to create sources dir")?;
     let dest_root = sources_base.join(name);
@@ -127,23 +190,11 @@ pub fn copy_dir_into_sources(source_dir: &Path, pack_dir: &Path, name: &str) -> 
         fs::remove_dir_all(&dest_root).context("failed to remove existing source dir")?;
     }
     fs::create_dir_all(&dest_root).context("failed to create source subdir")?;
-    for entry in WalkDir::new(source_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
-        let rel = path.strip_prefix(source_dir).context("strip prefix")?;
-        if rel.components().any(|c| c.as_os_str() == ".memkit") {
-            continue;
-        }
-        let dest = dest_root.join(rel);
-        if let Some(p) = dest.parent() {
-            fs::create_dir_all(p).context("failed to create dest parent")?;
-        }
-        fs::copy(path, &dest).with_context(|| format!("failed to copy {}", path.display()))?;
-    }
-    Ok(dest_root)
+    copy_tree_into(source_dir, &dest_root)?;
+    Ok(CopyDirOutcome {
+        source_root: format!("sources/{}", name),
+        cleanup_after_index: None,
+    })
 }
 
 /// Copies a single file into pack_dir/sources/_files/<filename>. Creates sources/_files if needed.
@@ -161,17 +212,25 @@ pub fn copy_file_into_sources(source: &Path, pack_dir: &Path) -> Result<PathBuf>
     Ok(dest)
 }
 
-/// Adds a pack-relative source root to the manifest if not already present. Saves manifest.
-pub fn add_source_root(pack_dir: &Path, pack_relative_root: &str) -> Result<()> {
+/// Adds a source root to the manifest if not already present. root_path can be pack-relative or absolute. Saves manifest.
+pub fn add_source_root(pack_dir: &Path, root_path: &str) -> Result<()> {
     let mut manifest = load_manifest(pack_dir)?;
-    if manifest.sources.iter().any(|s| s.root_path == pack_relative_root) {
+    if manifest.sources.iter().any(|s| s.root_path == root_path) {
         return Ok(());
     }
     manifest.sources.push(SourceConfig {
-        root_path: pack_relative_root.to_string(),
+        root_path: root_path.to_string(),
         include: vec!["**/*".to_string()],
         exclude: vec!["**/.git/**".to_string(), "**/target/**".to_string()],
     });
+    save_manifest(pack_dir, manifest)?;
+    Ok(())
+}
+
+/// Removes a source root from the manifest. Saves manifest.
+pub fn remove_source_root(pack_dir: &Path, root_path: &str) -> Result<()> {
+    let mut manifest = load_manifest(pack_dir)?;
+    manifest.sources.retain(|s| s.root_path != root_path);
     save_manifest(pack_dir, manifest)?;
     Ok(())
 }

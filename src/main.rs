@@ -28,10 +28,13 @@ mod server;
 mod types;
 
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use indicatif::ProgressBar;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
@@ -89,9 +92,9 @@ use owo_colors::OwoColorize;
 
 use crate::cli_client::{ServerConfig, QueryArgs};
 use crate::pack::{
-    add_source_root, copy_dir_into_sources, copy_file_into_sources, scrub_pack_from_dir,
+    add_source_root, init_pack, scrub_pack_from_dir,
 };
-use crate::registry::{load_registry, pack_dir_for_path, remove_pack, remove_pack_by_path, resolve_pack_by_name_or_path, set_default};
+use crate::registry::{ensure_registered, load_registry, pack_dir_for_path, remove_pack_by_path, resolve_pack_by_name_or_path, set_default};
 use crate::server::run_server;
 
 struct ServeConfig {
@@ -106,7 +109,7 @@ enum CliCommand {
         pack: Option<String>,
         api_request: Option<serde_json::Value>,
     },
-    Remove { dir: Option<String> },
+    Remove { dir: Option<String>, yes: bool },
     Status { dir: Option<String> },
     List,
     Index { dir: String, name: Option<String> },
@@ -124,14 +127,13 @@ enum CliCommand {
         destination: Option<String>,
     },
     Use { pack: Option<String> },
-    Unregister { pack: Option<String> },
     Help,
 }
 
 /// Packs to pass to the server when the CLI starts it. Used only for ensure_server.
 fn packs_for_command(cmd: &CliCommand) -> Result<Vec<PathBuf>> {
     let packs = match cmd {
-        CliCommand::Add { pack, .. } => vec![resolve_pack_root(pack.as_deref())?],
+        CliCommand::Add { pack, .. } => vec![ensure_pack_root(pack.as_deref())?],
         CliCommand::Index { dir, .. } => {
             vec![PathBuf::from(dir)
                 .canonicalize()
@@ -148,7 +150,7 @@ fn packs_for_command(cmd: &CliCommand) -> Result<Vec<PathBuf>> {
         CliCommand::Query { pack, .. } => vec![resolve_pack_root(pack.as_deref())?],
         CliCommand::Publish { pack, .. } => vec![resolve_pack_root(pack.as_deref())?],
         CliCommand::Use { pack } => vec![resolve_pack_root(pack.as_deref())?],
-        CliCommand::Remove { .. } | CliCommand::Unregister { .. } | CliCommand::Schema { .. } | CliCommand::Help => {
+        CliCommand::Remove { .. } | CliCommand::Schema { .. } | CliCommand::Help => {
             vec![resolve_pack_root(None)?]
         }
     };
@@ -173,6 +175,37 @@ fn resolve_pack_root(pack_arg: Option<&str>) -> Result<PathBuf> {
     anyhow::bail!(
         "no memory pack found. use --pack <name-or-path> or run `mk index <dir>` first"
     )
+}
+
+/// Create a default memory pack in the home directory (~/.memkit) with a generated name (e.g. for first-time add).
+fn create_default_pack() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("home directory not available")?;
+    let pack_dir = pack_dir_for_path(&home);
+    init_pack(&pack_dir, false, "fastembed", "BAAI/bge-small-en-v1.5", 384)
+        .context("failed to init default pack")?;
+    let normalized = home
+        .canonicalize()
+        .context("home directory path invalid")?
+        .to_string_lossy()
+        .to_string();
+    let reg = load_registry().unwrap_or_default();
+    ensure_registered(&normalized, None, reg.packs.is_empty())?;
+    Ok(home)
+}
+
+/// Resolve pack root; if none exists and pack_arg is None, create a default pack in ~ and return it.
+fn ensure_pack_root(pack_arg: Option<&str>) -> Result<PathBuf> {
+    match resolve_pack_root(pack_arg) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            if pack_arg.is_none() && e.to_string().contains("no memory pack found") {
+                create_default_pack()?;
+                resolve_pack_root(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 fn parse_pack_paths(value: &str) -> Vec<PathBuf> {
@@ -310,7 +343,8 @@ fn cli_command_from_json(cmd: &str, j: &serde_json::Value) -> Result<CliCommand>
             if let Some(ref d) = dir {
                 crate::validate::validate_path(d)?;
             }
-            Ok(CliCommand::Remove { dir })
+            let yes = get_bool("confirm").unwrap_or(false);
+            Ok(CliCommand::Remove { dir, yes })
         }
         "status" => {
             let dir = get_str("dir");
@@ -341,7 +375,6 @@ fn cli_command_from_json(cmd: &str, j: &serde_json::Value) -> Result<CliCommand>
         }),
         "schema" => Ok(CliCommand::Schema { command: get_str("schema") }),
         "use" => Ok(CliCommand::Use { pack: get_str("pack") }),
-        "unregister" => Ok(CliCommand::Unregister { pack: get_str("pack") }),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(anyhow!("unknown command: {}. run `mk help` for usage", other)),
     }
@@ -403,18 +436,35 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
         }
         "remove" => {
             let (json_val, rest) = extract_json_from_args(&args[1..]);
+            let mut yes = false;
+            let mut dir = None::<String>;
             if let Some(j) = json_val {
-                let dir = j.get("dir").and_then(serde_json::Value::as_str).map(String::from);
+                dir = j.get("dir").and_then(serde_json::Value::as_str).map(String::from);
                 if let Some(ref d) = dir {
                     crate::validate::validate_path(d)?;
                 }
-                return Ok(CliCommand::Remove { dir });
+                yes = j.get("confirm").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                return Ok(CliCommand::Remove { dir, yes });
             }
-            let dir = rest.first().cloned();
-            if let Some(ref d) = dir {
-                crate::validate::validate_path(d)?;
+            let mut i = 0usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--yes" | "-y" => {
+                        yes = true;
+                        i += 1;
+                    }
+                    _ => {
+                        if dir.is_none() {
+                            dir = Some(rest[i].clone());
+                            if let Some(ref d) = dir {
+                                crate::validate::validate_path(d)?;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
             }
-            Ok(CliCommand::Remove { dir })
+            Ok(CliCommand::Remove { dir, yes })
         }
         "status" => {
             let (json_val, rest) = extract_json_from_args(&args[1..]);
@@ -591,22 +641,6 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
             }
             Ok(CliCommand::Use { pack })
         }
-        "unregister" => {
-            let mut pack = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                if args[i] == "--pack" && args.get(i + 1).is_some() {
-                    pack = args.get(i + 1).cloned();
-                    i += 2;
-                } else if !args[i].starts_with('-') {
-                    pack = Some(args[i].clone());
-                    i += 1;
-                } else {
-                    i += 1;
-                }
-            }
-            Ok(CliCommand::Unregister { pack })
-        }
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(anyhow!(
             "unknown command: {}. run `mk help` for usage",
@@ -615,7 +649,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
     }
 }
 
-const SCHEMA_COMMANDS: &[&str] = &["add", "remove", "status", "index", "graph", "query", "use", "unregister"];
+const SCHEMA_COMMANDS: &[&str] = &["add", "remove", "status", "index", "graph", "query", "use"];
 
 fn schema_for_command(cmd: &str) -> Option<serde_json::Value> {
     Some(match cmd {
@@ -698,16 +732,6 @@ fn schema_for_command(cmd: &str) -> Option<serde_json::Value> {
                 }
             }
         }),
-        "unregister" => serde_json::json!({
-            "command": "unregister",
-            "input": {
-                "type": "object",
-                "properties": {
-                    "pack": {"type": "string", "description": "Pack name or path to remove from registry"}
-                },
-                "required": ["pack"]
-            }
-        }),
         _ => return None,
     })
 }
@@ -761,7 +785,6 @@ fn print_help() {
         "  mk query <text> [--top-k N] [--no-rerank] [--pack <name-or-path>] [--raw]",
         "  mk publish [--pack <name-or-path>] [--destination s3://bucket/prefix]",
         "  mk use [name-or-path]",
-        "  mk unregister <name-or-path>",
         "  mk schema [command]",
     ];
     for cmd in commands {
@@ -776,6 +799,24 @@ fn print_help() {
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    // #region agent log
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-085e7a.log") {
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into());
+        let data = serde_json::json!({
+            "sessionId": "085e7a",
+            "location": "main.rs:after dotenv",
+            "message": "env after dotenv",
+            "data": {
+                "memkit_json_set": std::env::var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON").is_ok(),
+                "google_creds_set": std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok(),
+                "cwd": cwd
+            },
+            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+            "hypothesisId": "H1 H2 H4"
+        });
+        let _ = writeln!(f, "{}", data.to_string());
+    }
+    // #endregion
     let args: Vec<String> = env::args().skip(1).collect();
     let (args, ctx) = parse_global_flags(&args);
 
@@ -794,14 +835,15 @@ async fn main() -> Result<()> {
             let cfg = ServerConfig::from_env();
 
             match &cmd {
-                CliCommand::Remove { dir } => {
-                    let target = dir
-                        .as_deref()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-                    let target = target
-                        .canonicalize()
-                        .with_context(|| format!("path not found: {}", target.display()))?;
+                CliCommand::Remove { dir, yes } => {
+                    let target = if let Some(name_or_path) = dir.as_deref() {
+                        resolve_pack_by_name_or_path(name_or_path)?
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from("."))
+                            .canonicalize()
+                            .with_context(|| "path not found: current directory")?
+                    };
                     if ctx.dry_run {
                         let out = serde_json::json!({
                             "dry_run": true,
@@ -812,44 +854,77 @@ async fn main() -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&out)?);
                         return Ok(());
                     }
-                    #[cfg(feature = "helix")]
-                    crate::helix_store::remove_helix_for_pack(&target)?;
-                    let was_in_registry = remove_pack_by_path(&target)?;
-                    match scrub_pack_from_dir(&target) {
-                        Ok(()) => {
-                            if crate::term::color_stdout() {
-                                println!("{} scrubbed from {}", "Memory pack removed".green(), target.display());
-                            } else {
-                                println!("Memory pack removed from {}", target.display());
-                            }
+                    if !*yes {
+                        use std::io::IsTerminal;
+                        if !std::io::stdin().is_terminal() {
+                            anyhow::bail!("not a TTY; pass --yes to remove without confirmation");
                         }
-                        Err(e) => {
-                            if was_in_registry {
-                                if crate::term::color_stdout() {
-                                    println!("{} {} (no pack artifacts in directory)", "Pack removed from registry".green(), target.display());
-                                } else {
-                                    println!("Pack removed from registry {} (no pack artifacts in directory)", target.display());
-                                }
-                            } else {
-                                return Err(e);
-                            }
+                        print!("Remove pack at {}? [y/N] ", target.display());
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line).context("read confirmation")?;
+                        let confirmed = line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes");
+                        if !confirmed {
+                            return Ok(());
                         }
+                        // Spawn background child and return immediately.
+                        let exe = std::env::current_exe().context("current executable")?;
+                        let path_str = target.display().to_string();
+                        let child = std::process::Command::new(&exe)
+                            .arg("remove")
+                            .arg("--yes")
+                            .arg(&path_str)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .context("spawn background remove")?;
+                        let pid = child.id();
+                        if crate::term::color_stdout() {
+                            println!("{} (pid {})", "Removal running in background".green(), pid);
+                        } else {
+                            println!("Removal running in background (pid {})", pid);
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                CliCommand::Unregister { pack } => {
-                    let name_or_path = pack
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("usage: mk unregister <name-or-path>"))?;
-                    let pack_root = resolve_pack_by_name_or_path(name_or_path)?;
-                    #[cfg(feature = "helix")]
-                    crate::helix_store::remove_helix_for_pack(&pack_root)?;
-                    remove_pack(name_or_path)?;
-                    if crate::term::color_stdout() {
-                        println!("{} {}", "Pack removed from registry".green(), name_or_path);
+                    let spinner = if crate::term::color_stdout() {
+                        let pb = ProgressBar::new_spinner();
+                        pb.set_message("Removing…");
+                        pb.enable_steady_tick(Duration::from_millis(80));
+                        Some(pb)
                     } else {
-                        println!("Pack removed from registry {}", name_or_path);
+                        None
+                    };
+                    let result = (|| -> Result<()> {
+                        #[cfg(feature = "helix")]
+                        crate::helix_store::remove_helix_for_pack(&target)?;
+                        let was_in_registry = remove_pack_by_path(&target)?;
+                        match scrub_pack_from_dir(&target) {
+                            Ok(()) => {
+                                if crate::term::color_stdout() {
+                                    println!("{} scrubbed from {}", "Memory pack removed".green(), target.display());
+                                } else {
+                                    println!("Memory pack removed from {}", target.display());
+                                }
+                            }
+                            Err(e) => {
+                                if was_in_registry {
+                                    if crate::term::color_stdout() {
+                                        println!("{} {} (no pack artifacts in directory)", "Pack removed from registry".green(), target.display());
+                                    } else {
+                                        println!("Pack removed from registry {} (no pack artifacts in directory)", target.display());
+                                    }
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Some(pb) = spinner {
+                        pb.finish_and_clear();
                     }
+                    result?;
                     return Ok(());
                 }
                 CliCommand::Use { pack } => {
@@ -920,6 +995,9 @@ async fn main() -> Result<()> {
                                 obj.insert("path".to_string(), serde_json::Value::String(pack_root.to_string_lossy().to_string()));
                             }
                             let out = cli_client::add(&effective_cfg, &body).await?;
+                            if ctx.output_format != OutputFormat::Json {
+                                cli_client::print_add_started(&out, pack_root.to_string_lossy().as_ref());
+                            }
                             Ok(CommandOut::Output(out))
                         }
                     } else {
@@ -948,30 +1026,30 @@ async fn main() -> Result<()> {
                                     pack_root.display()
                                 );
                             }
-                            let (dest, pack_relative) = if source.is_dir() {
-                                let name = source
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "unnamed".to_string());
-                                let d = copy_dir_into_sources(&source, &pack_dir, &name)?;
-                                (d, format!("sources/{}", name))
-                            } else {
-                                let d = copy_file_into_sources(&source, &pack_dir)?;
-                                (d, "sources/_files".to_string())
-                            };
-                            add_source_root(&pack_dir, &pack_relative)?;
-                            if crate::term::color_stdout() {
-                                println!(
-                                    "{} {} -> {}",
-                                    "Copied".green(),
-                                    source.display(),
-                                    dest.display()
+                            // Never add home directory as a source (e.g. pack at ~/.memkit must not index ~).
+                            let home = dirs::home_dir().context("home directory not available")?;
+                            let home_canon = home.canonicalize().unwrap_or(home.clone());
+                            if source == home_canon {
+                                anyhow::bail!(
+                                    "Cannot add home directory as a source. Add specific directories (e.g. mk add ~/Documents/...) instead."
                                 );
+                            }
+                            // Register source by path (index in place; no copy into .memkit/sources).
+                            let root_path = if source.is_dir() {
+                                source.to_string_lossy().to_string()
                             } else {
-                                println!("Copied {} -> {}", source.display(), dest.display());
+                                source
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| source.to_string_lossy().to_string())
+                            };
+                            add_source_root(&pack_dir, &root_path)?;
+                            if crate::term::color_stdout() {
+                                println!("{} {}", "Added source".green(), source.display());
+                            } else {
+                                println!("Added source {}", source.display());
                             }
                             let out = cli_client::index(&effective_cfg, pack_root.to_string_lossy().as_ref(), None, false, ctx.output_format == OutputFormat::Json).await?;
-                            cli_client::poll_until_index_done(&effective_cfg, pack_root.to_string_lossy().as_ref()).await?;
                             Ok(CommandOut::Output(out))
                         }
                     }
@@ -1004,6 +1082,16 @@ async fn main() -> Result<()> {
                     Ok(CommandOut::Done)
                 }
                 CliCommand::Index { dir, name } => {
+                    let index_dir = PathBuf::from(&dir)
+                        .canonicalize()
+                        .with_context(|| format!("path not found: {}", dir))?;
+                    let home = dirs::home_dir().context("home directory not available")?;
+                    let home_canon = home.canonicalize().unwrap_or(home);
+                    if index_dir == home_canon {
+                        anyhow::bail!(
+                            "Indexing your home directory is not allowed. Add specific directories with 'mk add <path>' instead."
+                        );
+                    }
                     let out = cli_client::index(&effective_cfg, &dir, name.as_deref(), ctx.dry_run, ctx.output_format == OutputFormat::Json).await?;
                     if !ctx.dry_run {
                         cli_client::poll_until_index_done(&effective_cfg, &dir).await?;
@@ -1059,7 +1147,7 @@ async fn main() -> Result<()> {
                         Ok(CommandOut::Output(out))
                     }
                 }
-                CliCommand::Help | CliCommand::Remove { .. } | CliCommand::Schema { .. } | CliCommand::Use { .. } | CliCommand::Unregister { .. } => unreachable!(),
+                CliCommand::Help | CliCommand::Remove { .. } | CliCommand::Schema { .. } | CliCommand::Use { .. } => unreachable!(),
             };
             guard.shutdown()?;
             let command_out = result?;
