@@ -77,7 +77,7 @@ fn pid_write(pid: u32) -> Result<()> {
 }
 
 fn pid_remove() {
-    let _ = server_pid_path().and_then(|p| fs::remove_file(p));
+    let _ = server_pid_path().and_then(|p| fs::remove_file(p).map_err(anyhow::Error::from));
 }
 
 fn pid_read_and_kill() {
@@ -540,7 +540,7 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
                 let counts_suffix = format!("{} vectors, {} entities, {} relationships", vector_count, entities, relationships);
                 let active_obj = active_job.and_then(Value::as_object);
                 let is_remove_job_for_this_pack = active_obj.as_ref().and_then(|o| o.get("job_type").and_then(Value::as_str)) == Some("remove_pack")
-                    && active_obj.as_ref().and_then(|o| o.get("pack_path").and_then(Value::as_str)).as_ref() == Some(&p.path);
+                    && active_obj.as_ref().and_then(|o| o.get("pack_path").and_then(Value::as_str)) == Some(p.path.as_str());
                 let status_line = if is_remove_job_for_this_pack {
                     "removing...".to_string()
                 } else if let Some(ref obj) = active_obj {
@@ -617,7 +617,12 @@ pub async fn remove(cfg: &ServerConfig, path: &str) -> Result<Value> {
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        return Err(anyhow!("remove request failed: {}", body));
+        let msg = if body.is_empty() {
+            format!("remove request failed: HTTP {} (empty response). If you recently updated, try stopping any running mk server and run the command again.", status.as_u16())
+        } else {
+            format!("remove request failed: {}", body)
+        };
+        return Err(anyhow!("{}", msg));
     }
     Ok(serde_json::from_str(&body)?)
 }
