@@ -92,6 +92,35 @@ use crate::pack::{add_source_root, init_pack};
 use crate::registry::{ensure_registered, load_registry, pack_dir_for_path, resolve_pack_by_name_or_path, set_default};
 use crate::server::run_server;
 
+/// Wrap a single line at `width` chars; newlines in `s` are collapsed to space. Truncate to `max_chars` first.
+fn wrap_retrieval_preview(s: &str, width: usize, max_chars: usize) -> String {
+    let flat = s.replace('\n', " ");
+    let truncated = if flat.len() > max_chars {
+        format!("{}...", flat.chars().take(max_chars).collect::<String>())
+    } else {
+        flat
+    };
+    if truncated.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut remaining = truncated.as_str();
+    let indent = "    ";
+    while !remaining.is_empty() {
+        let take = remaining.chars().take(width).count();
+        if take == 0 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(indent);
+        out.push_str(&remaining.chars().take(width).collect::<String>());
+        remaining = &remaining[remaining.char_indices().nth(take).map(|(i, _)| i).unwrap_or(remaining.len())..];
+    }
+    out
+}
+
 /// For add responses, replace full "content" in job.add_payload.items with a short placeholder so stdout isn't flooded.
 fn trim_add_response_content(out: &serde_json::Value) -> serde_json::Value {
     let mut v = out.clone();
@@ -146,34 +175,14 @@ enum CliCommand {
         destination: Option<String>,
     },
     Use { pack: Option<String> },
+    Serve {
+        pack: Option<String>,
+        host: Option<String>,
+        port: Option<u16>,
+        foreground: bool,
+    },
+    Stop { port: Option<u16> },
     Help,
-}
-
-/// Packs to pass to the server when the CLI starts it. Used only for ensure_server.
-fn packs_for_command(cmd: &CliCommand) -> Result<Vec<PathBuf>> {
-    let packs = match cmd {
-        CliCommand::Add { pack, .. } => vec![ensure_pack_root(pack.as_deref())?],
-        CliCommand::Index { dir, .. } => {
-            vec![PathBuf::from(dir)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(dir))]
-        }
-        CliCommand::Status { dir } => match dir {
-            Some(d) => vec![PathBuf::from(d)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(d))],
-            None => vec![resolve_pack_root(None)?],
-        },
-        CliCommand::List => vec![resolve_pack_root(None)?],
-        CliCommand::Graph { pack } => vec![resolve_pack_root(pack.as_deref())?],
-        CliCommand::Query { pack, .. } => vec![resolve_pack_root(pack.as_deref())?],
-        CliCommand::Publish { pack, .. } => vec![resolve_pack_root(pack.as_deref())?],
-        CliCommand::Use { pack } => vec![resolve_pack_root(pack.as_deref())?],
-        CliCommand::Remove { .. } | CliCommand::Schema { .. } | CliCommand::Help => {
-            vec![resolve_pack_root(None)?]
-        }
-    };
-    Ok(packs)
 }
 
 fn resolve_pack_root(pack_arg: Option<&str>) -> Result<PathBuf> {
@@ -214,7 +223,7 @@ fn create_default_pack() -> Result<PathBuf> {
         .to_string_lossy()
         .to_string();
     let reg = load_registry().unwrap_or_default();
-    ensure_registered(&normalized, None, reg.packs.is_empty())?;
+    ensure_registered(&normalized, Some("default".to_string()), reg.packs.is_empty())?;
     Ok(home)
 }
 
@@ -666,6 +675,46 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
             }
             Ok(CliCommand::Use { pack })
         }
+        "serve" => {
+            let mut pack = None;
+            let mut host = None;
+            let mut port = None;
+            let mut foreground = false;
+            let mut i = 1usize;
+            while i < args.len() {
+                if args[i] == "--pack" && args.get(i + 1).is_some() {
+                    pack = args.get(i + 1).cloned();
+                    i += 2;
+                } else if args[i] == "--host" && args.get(i + 1).is_some() {
+                    host = args.get(i + 1).cloned();
+                    i += 2;
+                } else if args[i] == "--port" && args.get(i + 1).is_some() {
+                    let p = args[i + 1].parse::<u16>().map_err(|_| anyhow!("invalid --port value"))?;
+                    port = Some(p);
+                    i += 2;
+                } else if args[i] == "--foreground" {
+                    foreground = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(CliCommand::Serve { pack, host, port, foreground })
+        }
+        "stop" => {
+            let mut port = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                if args[i] == "--port" && args.get(i + 1).is_some() {
+                    let p = args[i + 1].parse::<u16>().map_err(|_| anyhow!("invalid --port value"))?;
+                    port = Some(p);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(CliCommand::Stop { port })
+        }
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(anyhow!(
             "unknown command: {}. run `mk help` for usage",
@@ -810,6 +859,8 @@ fn print_help() {
         "  mk query <text> [--top-k N] [--no-rerank] [--pack <name-or-path>] [--raw]",
         "  mk publish [--pack <name-or-path>] [--destination s3://bucket/prefix]",
         "  mk use [name-or-path]",
+        "  mk serve [--pack <path>] [--host H] [--port P] [--foreground]  (run server in background; use --foreground to attach)",
+        "  mk stop [--port P]  (stop the background server)",
         "  mk schema [command]",
     ];
     for cmd in commands {
@@ -822,14 +873,42 @@ fn print_help() {
 }
 
 /// If dotenvy failed to set MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON (e.g. value has newlines), try loading
-/// it from .env manually: find MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON= and use the rest of the file as the value.
-/// Tries current_dir() first, then the executable's directory and parents (so a server spawned from
-/// another cwd still finds .env in the repo).
+/// it from .env manually: find MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON= and parse the value (stop at next
+/// KEY= or end of file; strip surrounding quotes). Tries current_dir(), then executable's directory
+/// and parents, then ~/.memkit/.env.
 fn load_memkit_google_json_from_dotenv_fallback() {
     if std::env::var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON").is_ok() {
         return;
     }
     const PREFIX: &str = "MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON=";
+
+    /// Extract value after PREFIX: stop at next line that looks like VAR= so we don't pull in the next env entry.
+    fn extract_value(content: &str, after_prefix: usize) -> &str {
+        let rest = content[after_prefix..].trim_start();
+        if rest.is_empty() {
+            return rest;
+        }
+        let lines: Vec<&str> = rest.split('\n').collect();
+        let mut value_end = rest.len();
+        let mut offset = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if i >= 1 {
+                let trimmed = line.trim_start();
+                if !trimmed.is_empty() {
+                    let first = trimmed.chars().next().unwrap();
+                    if first.is_ascii_alphabetic() || first == '_' {
+                        let key_len = trimmed.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+                        if key_len > 0 && trimmed.chars().nth(key_len) == Some('=') {
+                            value_end = offset;
+                            break;
+                        }
+                    }
+                }
+            }
+            offset += line.len() + 1;
+        }
+        rest[..value_end.min(rest.len())].trim_end()
+    }
 
     let try_env_file = |path: &std::path::Path| -> bool {
         let content = match std::fs::read_to_string(path) {
@@ -840,7 +919,14 @@ fn load_memkit_google_json_from_dotenv_fallback() {
             Some(i) => i,
             None => return false,
         };
-        let value = content[idx + PREFIX.len()..].trim_end();
+        let mut value = extract_value(&content, idx + PREFIX.len()).to_string();
+        if value.is_empty() || !value.starts_with('{') {
+            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                value = value[1..value.len() - 1].replace("\\\"", "\"");
+            } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+                value = value[1..value.len() - 1].to_string();
+            }
+        }
         if value.starts_with('{') {
             // SAFETY: single-threaded at startup; no other thread reads this var yet.
             unsafe { std::env::set_var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON", value); }
@@ -866,6 +952,11 @@ fn load_memkit_google_json_from_dotenv_fallback() {
         }
         dir = d.parent().map(|p| p.to_path_buf());
     }
+    if let Some(home) = dirs::home_dir() {
+        if try_env_file(&home.join(".memkit").join(".env")) {
+            return;
+        }
+    }
 }
 
 #[tokio::main]
@@ -884,6 +975,67 @@ async fn main() -> Result<()> {
         CliCommand::Help => print_help(),
         CliCommand::Schema { command } => {
             print_schema(command.as_deref())?;
+            return Ok(());
+        }
+        CliCommand::Serve { pack, host, port, foreground } => {
+            let run_server = env::var("MEMKIT_SERVE_FOREGROUND").is_ok() || foreground;
+            if !run_server {
+                let exe = std::env::current_exe()
+                    .map_err(|e| anyhow!("current exe: {}", e))?;
+                let child_args: Vec<String> = std::env::args().skip(1).collect();
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.args(&child_args).env("MEMKIT_SERVE_FOREGROUND", "1");
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+                cmd.spawn().map_err(|e| anyhow!("failed to start server process: {}", e))?;
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if crate::term::color_stdout() {
+                    println!("{}", "Server started in background. Use 'mk status' to check.".green());
+                } else {
+                    println!("Server started in background. Use 'mk status' to check.");
+                }
+                return Ok(());
+            }
+            let packs: Vec<PathBuf> = if let Some(ref p) = pack {
+                vec![resolve_pack_by_name_or_path(p)?]
+            } else {
+                let _ = crate::registry::ensure_default_if_unset();
+                let reg = load_registry().unwrap_or_default();
+                if reg.packs.is_empty() {
+                    anyhow::bail!("no packs registered. Add a pack first (e.g. mk add <path>) or run with --pack <path>");
+                }
+                reg.packs.iter().map(|p| PathBuf::from(&p.path)).collect()
+            };
+            let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = port.unwrap_or(4242);
+            serve_with_startup(packs, host, port).await?;
+            return Ok(());
+        }
+        CliCommand::Stop { port } => {
+            let port = port
+                .or_else(|| env::var("API_PORT").ok().and_then(|v| v.parse::<u16>().ok()))
+                .unwrap_or(4242);
+            let output = std::process::Command::new("lsof")
+                .args(["-ti", &format!(":{}", port)])
+                .output()
+                .context("lsof failed")?;
+            if output.status.success() && !output.stdout.is_empty() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for pid in stdout.trim().split_whitespace() {
+                    let _ = std::process::Command::new("kill").arg(pid).status();
+                }
+                if crate::term::color_stdout() {
+                    println!("{}", "Server stopped.".green());
+                } else {
+                    println!("Server stopped.");
+                }
+            } else {
+                if crate::term::color_stdout() {
+                    println!("{}", format!("No server running on port {}.", port).dimmed());
+                } else {
+                    println!("No server running on port {}.", port);
+                }
+            }
             return Ok(());
         }
         cmd => {
@@ -923,7 +1075,7 @@ async fn main() -> Result<()> {
                             return Ok(());
                         }
                     }
-                    // Fall through to use server remove job (ensure_server + POST /remove).
+                    // Fall through to use server remove job (POST /remove).
                 }
                 CliCommand::Use { pack } => {
                     let reg = load_registry()?;
@@ -958,17 +1110,10 @@ async fn main() -> Result<()> {
                 _ => {}
             }
 
-            let packs = packs_for_command(&cmd)?;
-            let (guard, effective_cfg) = match &cmd {
-                CliCommand::Index { .. } => {
-                    let (g, c) = cli_client::ensure_server_standalone(&cfg, &packs).await?;
-                    (g, c)
-                }
-                _ => {
-                    let g = cli_client::ensure_server(&cfg, &packs).await?;
-                    (g, cfg.clone())
-                }
-            };
+            let commands_need_server = !matches!(cmd, CliCommand::Help | CliCommand::Schema { .. } | CliCommand::Use { .. } | CliCommand::Serve { .. } | CliCommand::Stop { .. });
+            if commands_need_server {
+                cli_client::require_server(&cfg).await?;
+            }
 
             enum CommandOut {
                 Done,
@@ -985,7 +1130,7 @@ async fn main() -> Result<()> {
                             .with_context(|| "path not found: current directory")?
                     };
                     let path_str = target.display().to_string();
-                    let out = cli_client::remove(&effective_cfg, &path_str).await?;
+                    let out = cli_client::remove(&cfg, &path_str).await?;
                     if ctx.output_format != OutputFormat::Json {
                         if let Some(job_id) = out.get("job").and_then(|j| j.get("id")).and_then(|v| v.as_str()) {
                             if crate::term::color_stdout() {
@@ -1014,7 +1159,7 @@ async fn main() -> Result<()> {
                             if let Some(obj) = body.as_object_mut() {
                                 obj.insert("path".to_string(), serde_json::Value::String(pack_root.to_string_lossy().to_string()));
                             }
-                            let out = cli_client::add(&effective_cfg, &body).await?;
+                            let out = cli_client::add(&cfg, &body).await?;
                             if ctx.output_format != OutputFormat::Json {
                                 cli_client::print_add_started(&out, pack_root.to_string_lossy().as_ref());
                             }
@@ -1082,7 +1227,7 @@ async fn main() -> Result<()> {
                                 let _ = f.flush();
                             }
                             // #endregion
-                            let out = cli_client::index(&effective_cfg, &index_path, None, false, ctx.output_format == OutputFormat::Json).await?;
+                            let out = cli_client::index(&cfg, &index_path, None, false, ctx.output_format == OutputFormat::Json).await?;
                             Ok(CommandOut::Output(out))
                         }
                     }
@@ -1090,14 +1235,14 @@ async fn main() -> Result<()> {
                 CliCommand::Status { dir } => {
                     let output_json = ctx.output_format == OutputFormat::Json;
                     if dir.is_none() {
-                        let data = cli_client::list(&effective_cfg, output_json).await?;
+                        let data = cli_client::list(&cfg, output_json).await?;
                         if output_json {
                             let json_str = serde_json::to_string_pretty(&data)?;
                             println!("{}", json_str);
                         }
                         Ok(CommandOut::Done)
                     } else {
-                        let data = cli_client::status(&effective_cfg, dir.as_deref()).await?;
+                        let data = cli_client::status(&cfg, dir.as_deref()).await?;
                         if output_json {
                             println!("{}", serde_json::to_string_pretty(&data)?);
                         } else {
@@ -1108,7 +1253,7 @@ async fn main() -> Result<()> {
                 }
                 CliCommand::List => {
                     let output_json = ctx.output_format == OutputFormat::Json;
-                    let data = cli_client::list(&effective_cfg, output_json).await?;
+                    let data = cli_client::list(&cfg, output_json).await?;
                     if output_json {
                         println!("{}", serde_json::to_string_pretty(&data)?);
                     }
@@ -1125,19 +1270,19 @@ async fn main() -> Result<()> {
                             "Indexing your home directory is not allowed. Add specific directories with 'mk add <path>' instead."
                         );
                     }
-                    let out = cli_client::index(&effective_cfg, &dir, name.as_deref(), ctx.dry_run, ctx.output_format == OutputFormat::Json).await?;
+                    let out = cli_client::index(&cfg, &dir, name.as_deref(), ctx.dry_run, ctx.output_format == OutputFormat::Json).await?;
                     if !ctx.dry_run {
-                        cli_client::poll_until_index_done(&effective_cfg, &dir).await?;
+                        cli_client::poll_until_index_done(&cfg, &dir).await?;
                     }
                     Ok(CommandOut::Output(out))
                 }
                 CliCommand::Graph { pack: _ } => {
-                    cli_client::graph_show(&effective_cfg).await?;
+                    cli_client::graph_show(&cfg).await?;
                     Ok(CommandOut::Done)
                 }
                 CliCommand::Publish { pack, destination } => {
                     let out = cli_client::publish(
-                        &effective_cfg,
+                        &cfg,
                         pack.as_deref(),
                         destination.as_deref(),
                         ctx.output_format == OutputFormat::Json,
@@ -1149,13 +1294,60 @@ async fn main() -> Result<()> {
                     Ok(CommandOut::Done)
                 }
                 CliCommand::Query { query, top_k, use_reranker, raw, pack } => {
-                    let out = cli_client::query(&effective_cfg, &QueryArgs { query, top_k, use_reranker, raw }, pack.as_deref()).await?;
+                    let out = cli_client::query(&cfg, &QueryArgs { query, top_k, use_reranker, raw }, pack.as_deref()).await?;
                     let use_formatted = !raw && ctx.output_format != OutputFormat::Json;
                     if use_formatted {
-                        if let (Some(answer), Some(sources)) = (
+                        if let Some(synth_err) = out.get("synthesis_error").and_then(serde_json::Value::as_str) {
+                            if crate::term::color_stdout() {
+                                println!("{}", "Retrieval succeeded; synthesis failed:".yellow());
+                                println!("  {}", synth_err);
+                            } else {
+                                println!("Retrieval succeeded; synthesis failed:");
+                                println!("  {}", synth_err);
+                            }
+                            if let Some(results) = out.get("results").and_then(serde_json::Value::as_array) {
+                                if !results.is_empty() {
+                                    println!();
+                                    println!("Top results from your pack:");
+                                    for (i, r) in results.iter().take(5).enumerate() {
+                                        let path = r.get("file_path").and_then(serde_json::Value::as_str).unwrap_or("?");
+                                        let content = r.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+                                        let preview = if content.len() > 120 { format!("{}...", &content[..120]) } else { content.to_string() };
+                                        if crate::term::color_stdout() {
+                                            println!("  {}. {} {}", i + 1, path.dimmed(), preview.dimmed());
+                                        } else {
+                                            println!("  {}. {} {}", i + 1, path, preview);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(rr) = out.get("retrieval_results").and_then(serde_json::Value::as_array) {
+                                if !rr.is_empty() {
+                                    println!();
+                                    println!("Retrieval (vector store, before rerank):");
+                                    for (i, r) in rr.iter().take(10).enumerate() {
+                                        let path = r.get("file_path").and_then(serde_json::Value::as_str).unwrap_or("?");
+                                        let score = r.get("score").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                                        let content = r.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+                                        if crate::term::color_stdout() {
+                                            println!("  {}. {} score={:.3}", i + 1, path.dimmed(), score);
+                                            println!("{}", wrap_retrieval_preview(content, 72, 200).dimmed());
+                                        } else {
+                                            println!("  {}. {} score={:.3}", i + 1, path, score);
+                                            println!("{}", wrap_retrieval_preview(content, 72, 200));
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(CommandOut::Done)
+                        } else if let (Some(answer), Some(sources)) = (
                             out.get("answer").and_then(serde_json::Value::as_str),
                             out.get("sources").and_then(serde_json::Value::as_array),
                         ) {
+                            if let Some(model) = out.get("model").and_then(serde_json::Value::as_str) {
+                                println!("Model: {}", model);
+                                println!();
+                            }
                             if let Some(provider) = out.get("provider").and_then(serde_json::Value::as_str) {
                                 println!("[{}]", provider);
                                 println!();
@@ -1180,9 +1372,8 @@ async fn main() -> Result<()> {
                         Ok(CommandOut::Output(out))
                     }
                 }
-                CliCommand::Help | CliCommand::Schema { .. } | CliCommand::Use { .. } => unreachable!(),
+                CliCommand::Help | CliCommand::Schema { .. } | CliCommand::Use { .. } | CliCommand::Serve { .. } | CliCommand::Stop { .. } => unreachable!(),
             };
-            guard.shutdown()?;
             let command_out = result?;
             if let CommandOut::Output(out) = command_out {
                 let out_display = trim_add_response_content(&out);
