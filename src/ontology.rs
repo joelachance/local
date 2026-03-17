@@ -94,6 +94,33 @@ pub struct LlmConfig {
     pub max_tokens: usize,
     #[cfg_attr(not(feature = "llama-embedded"), allow(dead_code))]
     pub timeout_ms: u64,
+    /// Context length (KV cache size). Default 32768 (~1–2 GB extra KV RAM for a 2B model). Set MEMKIT_LLM_N_CTX to override.
+    #[cfg(feature = "llama-embedded")]
+    pub n_ctx: u32,
+}
+
+/// Resolve relative model path to absolute using current_dir() so the path works
+/// regardless of process cwd (e.g. server started from another directory).
+fn resolve_model_path(model: &str) -> String {
+    // #region agent log
+    let cwd_str = std::env::current_dir().ok().map(|c| c.display().to_string()).unwrap_or_default();
+    // #endregion
+    let p = Path::new(model);
+    if p.is_absolute() {
+        return model.to_string();
+    }
+    let resolved = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(p))
+        .and_then(|abs| abs.into_os_string().into_string().ok())
+        .unwrap_or_else(|| model.to_string());
+    // #region agent log
+    let exists = Path::new(&resolved).exists();
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let line = serde_json::json!({"sessionId":"ef491a","timestamp":ts,"location":"ontology.rs:resolve_model_path","message":"model path","data":{"raw":model,"cwd":cwd_str,"resolved":&resolved,"exists":exists},"hypothesisId":"A"});
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line).unwrap_or_default() + "\n").as_bytes()));
+    // #endregion
+    resolved
 }
 
 impl LlmConfig {
@@ -102,8 +129,9 @@ impl LlmConfig {
         let model = std::env::var("MEMKIT_LLM_MODEL")
             .or_else(|_| std::env::var("MEMKIT_ONTOLOGY_MODEL"))
             .unwrap_or_else(|_| {
-                ".local-runtime/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string()
+                ".local-runtime/models/qwen2.5-2b-instruct-Q8_0.gguf".to_string()
             });
+        let model = resolve_model_path(&model);
         let max_tokens = std::env::var("MEMKIT_LLM_MAX_TOKENS")
             .or_else(|_| std::env::var("MEMKIT_ONTOLOGY_MAX_TOKENS"))
             .ok()
@@ -114,11 +142,19 @@ impl LlmConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(20_000);
+        #[cfg(feature = "llama-embedded")]
+        let n_ctx = std::env::var("MEMKIT_LLM_N_CTX")
+            .or_else(|_| std::env::var("MEMKIT_ONTOLOGY_N_CTX"))
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(32768);
         Self {
             provider,
             model,
             max_tokens,
             timeout_ms,
+            #[cfg(feature = "llama-embedded")]
+            n_ctx,
         }
     }
 }
