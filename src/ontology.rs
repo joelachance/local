@@ -102,25 +102,15 @@ pub struct LlmConfig {
 /// Resolve relative model path to absolute using current_dir() so the path works
 /// regardless of process cwd (e.g. server started from another directory).
 fn resolve_model_path(model: &str) -> String {
-    // #region agent log
-    let cwd_str = std::env::current_dir().ok().map(|c| c.display().to_string()).unwrap_or_default();
-    // #endregion
     let p = Path::new(model);
     if p.is_absolute() {
         return model.to_string();
     }
-    let resolved = std::env::current_dir()
+    std::env::current_dir()
         .ok()
         .map(|cwd| cwd.join(p))
         .and_then(|abs| abs.into_os_string().into_string().ok())
-        .unwrap_or_else(|| model.to_string());
-    // #region agent log
-    let exists = Path::new(&resolved).exists();
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-    let line = serde_json::json!({"sessionId":"ef491a","timestamp":ts,"location":"ontology.rs:resolve_model_path","message":"model path","data":{"raw":model,"cwd":cwd_str,"resolved":&resolved,"exists":exists},"hypothesisId":"A"});
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line).unwrap_or_default() + "\n").as_bytes()));
-    // #endregion
-    resolved
+        .unwrap_or_else(|| model.to_string())
 }
 
 impl LlmConfig {

@@ -5,13 +5,6 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 
 use crate::embed::provider_from_name;
-#[cfg(feature = "lance-falkor")]
-use crate::falkor_store::{
-    graph_name_for_pack, graph_name_from_env, query_chunks as query_falkor_chunks, socket_from_env,
-};
-#[cfg(feature = "lance-falkor")]
-use crate::lancedb_store::{hybrid_query_with_uri, load_all_docs_with_uri};
-#[cfg(feature = "helix")]
 use crate::helix_store::{helix_hybrid_query, helix_load_all_docs, helix_pack_path_for_local};
 use crate::pack_location::PackLocation;
 use crate::pack::load_manifest_from_loc;
@@ -44,27 +37,16 @@ pub fn run_query(
     q: &str,
     top_k: usize,
     use_reranker: bool,
-    #[allow(unused_variables)]
-    graph_name_override: Option<&str>,
     path_filter: Option<&str>,
 ) -> Result<QueryResponse> {
     let total_start = Instant::now();
     let manifest = load_manifest_from_loc(loc)?;
     let dim = manifest.embedding.dimension;
 
-    let index_docs: Vec<_> = {
-        #[cfg(feature = "store-helix-only")]
-        {
-            let pack_path = loc
-                .as_path()
-                .ok_or_else(|| anyhow!("Helix-only build supports local packs only"))?;
-            helix_load_all_docs(&helix_pack_path_for_local(pack_path), dim)?
-        }
-        #[cfg(all(not(feature = "store-helix-only"), feature = "lance-falkor"))]
-        {
-            load_all_docs_with_uri(&loc.lancedb_uri(), loc.storage_options(), dim)?
-        }
-    };
+    let pack_path = loc
+        .as_path()
+        .ok_or_else(|| anyhow!("Helix build supports local packs only"))?;
+    let index_docs: Vec<_> = helix_load_all_docs(&helix_pack_path_for_local(pack_path), dim)?;
 
     let embed_start = Instant::now();
     let mut provider = provider_from_name(
@@ -87,98 +69,11 @@ pub fn run_query(
     let embed_ms = embed_start.elapsed().as_millis();
 
     let retrieval_start = Instant::now();
-    let mut hits: Vec<QueryHit> = {
-        #[cfg(feature = "store-helix-only")]
-        {
-            let pack_path = loc.as_path().expect("local pack required for helix");
-            let path = helix_pack_path_for_local(pack_path);
-            let top_for_backend = top_k.saturating_mul(2);
-            helix_hybrid_query(&path, q, &q_embedding, top_for_backend, path_filter)?
-        }
-        #[cfg(all(not(feature = "store-helix-only"), feature = "lance-falkor"))]
-        {
-            let lancedb_uri = loc.lancedb_uri();
-            let storage_options = loc.storage_options().map(|o| o.to_vec());
-            let query_text = q.to_string();
-            let falkor_socket = socket_from_env();
-            let graph_name = graph_name_override
-                .map(String::from)
-                .unwrap_or_else(graph_name_from_env);
-            let top_for_backend = top_k.saturating_mul(2);
-            let path_filter_lance = path_filter.map(String::from);
-            let path_filter_falkor = path_filter.map(String::from);
-            let (lancedb_hits, falkor_hits) = std::thread::scope(|scope| {
-                let lance = scope.spawn(|| {
-                    hybrid_query_with_uri(
-                        &lancedb_uri,
-                        storage_options.as_deref(),
-                        &query_text,
-                        &q_embedding,
-                        top_for_backend,
-                        path_filter_lance.as_deref(),
-                    )
-                    .unwrap_or_default()
-                });
-                let graph = scope.spawn(|| {
-                    if let Some(socket_path) = falkor_socket {
-                        query_falkor_chunks(
-                            &socket_path,
-                            &graph_name,
-                            &query_text,
-                            top_for_backend,
-                            path_filter_falkor.as_deref(),
-                        )
-                        .unwrap_or_else(|err| {
-                            crate::term::warn(format!(
-                                "warning: falkor query failed, continuing with lancedb: {err}"
-                            ));
-                            Vec::new()
-                        })
-                    } else {
-                        Vec::new()
-                    }
-                });
-                (lance.join().unwrap_or_default(), graph.join().unwrap_or_default())
-            });
-            let mut merged: HashMap<String, QueryHit> = HashMap::new();
-            for (rank, hit) in lancedb_hits.into_iter().enumerate() {
-                let rr = 1.0 / (60.0 + rank as f32 + 1.0);
-                merged
-                    .entry(hit.chunk_id.clone())
-                    .and_modify(|e| {
-                        e.score += rr;
-                        e.source = "vector".to_string();
-                    })
-                    .or_insert(QueryHit {
-                        score: rr,
-                        source: "vector".to_string(),
-                        ..hit
-                    });
-            }
-            for (rank, hit) in falkor_hits.into_iter().enumerate() {
-                let rr = (1.0 / (60.0 + rank as f32 + 1.0)) * 0.9;
-                merged
-                    .entry(hit.chunk_id.clone())
-                    .and_modify(|e| {
-                        e.score += rr;
-                        e.source = if e.source == "vector" { "both" } else { "graph" }.to_string();
-                    })
-                    .or_insert(QueryHit {
-                        score: rr,
-                        source: "graph".to_string(),
-                        ..hit
-                    });
-            }
-            merged
-                .into_values()
-                .map(|d| QueryHit {
-                    group_key: Some(d.file_path.clone()),
-                    ..d
-                })
-                .filter(|h| h.score > 0.0)
-                .collect()
-        }
-    };
+    let path = helix_pack_path_for_local(pack_path);
+    let top_for_backend = top_k.saturating_mul(2);
+    let mut hits: Vec<QueryHit> =
+        helix_hybrid_query(&path, q, &q_embedding, top_for_backend, path_filter)?;
+    let retrieval_results = hits.clone();
     let retrieval_ms = retrieval_start.elapsed().as_millis();
 
     let rerank_start = Instant::now();
@@ -296,6 +191,7 @@ pub fn run_query(
             rerank: rerank_ms,
             total: total_start.elapsed().as_millis(),
         },
+        retrieval_results: Some(retrieval_results),
     })
 }
 
@@ -310,7 +206,7 @@ pub fn run_query_multi(
         return Err(anyhow::anyhow!("at least one pack required"));
     }
     if packs.len() == 1 {
-        return run_query(&PackLocation::local(&packs[0]), q, top_k, use_reranker, None, path_filter);
+        return run_query(&PackLocation::local(&packs[0]), q, top_k, use_reranker, path_filter);
     }
 
     let total_start = Instant::now();
@@ -323,20 +219,7 @@ pub fn run_query_multi(
                 let loc = PackLocation::local(pack.clone());
                 let q = q.to_string();
                 let pf = path_filter_owned.clone();
-                scope.spawn(move || {
-                    #[cfg(feature = "lance-falkor")]
-                    let graph_name = loc.as_path().and_then(|p| graph_name_for_pack(p).ok());
-                    #[cfg(not(feature = "lance-falkor"))]
-                    let graph_name: Option<String> = None;
-                    run_query(
-                        &loc,
-                        &q,
-                        top_for_backend,
-                        use_reranker,
-                        graph_name.as_deref(),
-                        pf.as_deref(),
-                    )
-                })
+                scope.spawn(move || run_query(&loc, &q, top_for_backend, use_reranker, pf.as_deref()))
             })
             .collect();
         handles
@@ -386,5 +269,6 @@ pub fn run_query_multi(
             rerank: max_rerank,
             total: total_start.elapsed().as_millis(),
         },
+        retrieval_results: None,
     })
 }

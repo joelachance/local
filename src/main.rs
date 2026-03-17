@@ -9,12 +9,8 @@ mod registry;
 mod validate;
 mod embed;
 mod term;
-#[cfg(feature = "lance-falkor")]
-mod falkor_store;
 mod google;
 mod indexer;
-#[cfg(feature = "lance-falkor")]
-mod lancedb_store;
 mod ontology;
 mod ontology_candle;
 mod ontology_llama;
@@ -28,7 +24,6 @@ mod server;
 mod types;
 
 use std::env;
-use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use anyhow::{Context, Result, anyhow};
@@ -1220,13 +1215,6 @@ async fn main() -> Result<()> {
                                 .unwrap_or_else(|_| pack_dir.clone())
                                 .to_string_lossy()
                                 .to_string();
-                            // #region agent log
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-14a764.log") {
-                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-                                let _ = writeln!(f, "{}", serde_json::json!({"sessionId":"14a764","location":"main.rs:Add:index_path","message":"path sent to index","data":{"index_path":index_path,"pack_root":pack_root.to_string_lossy().to_string()},"timestamp":ts,"hypothesisId":"A"}));
-                                let _ = f.flush();
-                            }
-                            // #endregion
                             let out = cli_client::index(&cfg, &index_path, None, false, ctx.output_format == OutputFormat::Json).await?;
                             Ok(CommandOut::Output(out))
                         }
@@ -1397,10 +1385,6 @@ pub(crate) async fn serve_with_startup(packs: Vec<PathBuf>, host: String, port: 
         .ok()
         .and_then(|p| u16::from_str(&p).ok())
         .unwrap_or(port);
-    #[cfg(feature = "lance-falkor")]
-    let falkordb_socket = env::var("FALKORDB_SOCKET").ok();
-    #[cfg(not(feature = "lance-falkor"))]
-    let falkordb_socket: Option<String> = None;
     if color {
         let pack_display = if packs.len() == 1 {
             packs[0].display().to_string()
@@ -1422,6 +1406,6 @@ pub(crate) async fn serve_with_startup(packs: Vec<PathBuf>, host: String, port: 
             println!("serving {} packs on {}:{}", packs.len(), host, port);
         }
     }
-    run_server(packs, host, port, falkordb_socket).await?;
+    run_server(packs, host, port).await?;
     Ok(())
 }

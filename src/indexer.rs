@@ -8,15 +8,9 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::embed::provider_from_name;
-#[cfg(feature = "lance-falkor")]
-use crate::falkor_store::{
-    ChunkGraphPayload, delete_chunks_for_paths, graph_name_from_env, socket_from_env, upsert_chunks,
-};
-#[cfg(feature = "lance-falkor")]
-use crate::lancedb_store::{ensure_chunk_ids, load_all_docs, rebuild_tables};
-#[cfg(feature = "store-helix-only")]
 use crate::helix_store::{
-    helix_load_all_docs, helix_pack_path_for_local, helix_rebuild_chunks, helix_write_graph_stats,
+    helix_clear_entity_map, helix_load_entity_id_map, helix_load_all_docs, helix_pack_path_for_local,
+    helix_rebuild_chunks, helix_write_entities_edges, helix_write_graph_stats,
 };
 use crate::ontology::OntologyEngine;
 use crate::pack::{
@@ -60,15 +54,16 @@ pub(crate) fn chunk_text(
 
     let mut out = Vec::new();
     let mut start = 0usize;
-    let bytes = content.as_bytes();
-    while start < bytes.len() {
-        let end = (start + target_chars).min(bytes.len());
+    while start < content.len() {
+        let end_byte = (start + target_chars).min(content.len());
+        let end = content.floor_char_boundary(end_byte);
         let chunk = content[start..end].to_string();
         out.push((start, end, chunk));
-        if end == bytes.len() {
+        if end == content.len() {
             break;
         }
-        start = end.saturating_sub(overlap_chars);
+        let next_start = end.saturating_sub(overlap_chars);
+        start = content.floor_char_boundary(next_start);
     }
     out
 }
@@ -111,24 +106,11 @@ fn to_source_configs(pack_dir: &Path, sources: &[PathBuf]) -> Vec<SourceConfig> 
         .collect()
 }
 
-#[allow(unused_variables)]
-pub fn run_index(
-    pack_dir: &Path,
-    sources: &[PathBuf],
-    graph_name_override: Option<&str>,
-) -> Result<(usize, usize, usize)> {
+pub fn run_index(pack_dir: &Path, sources: &[PathBuf]) -> Result<(usize, usize, usize)> {
     let mut manifest = load_manifest(pack_dir)?;
     manifest.sources = to_source_configs(pack_dir, sources);
-    let existing_docs: Vec<_> = {
-        #[cfg(feature = "store-helix-only")]
-        {
-            helix_load_all_docs(&helix_pack_path_for_local(pack_dir), manifest.embedding.dimension)?
-        }
-        #[cfg(feature = "lance-falkor")]
-        {
-            load_all_docs(pack_dir, manifest.embedding.dimension)?
-        }
-    };
+    let existing_docs: Vec<_> =
+        helix_load_all_docs(&helix_pack_path_for_local(pack_dir), manifest.embedding.dimension)?;
     let existing_by_chunk: HashMap<String, SourceDoc> = existing_docs
         .into_iter()
         .map(|d| (d.chunk_id.clone(), d))
@@ -138,8 +120,6 @@ pub fn run_index(
         .drain(..)
         .map(|s| (s.file_path.clone(), s))
         .collect();
-    #[allow(unused_variables)]
-    let previous_paths: HashSet<String> = state_by_path.keys().cloned().collect();
 
     let mut scanned = 0usize;
     let mut updated_files = 0usize;
@@ -281,79 +261,35 @@ pub fn run_index(
         }
     }
 
-    #[cfg(feature = "lance-falkor")]
-    {
-        ensure_chunk_ids(&mut next_docs);
-        ensure_chunk_ids(&mut changed_docs);
-        rebuild_tables(pack_dir, &next_docs, manifest.embedding.dimension)
-            .context("failed to rebuild lancedb tables/indexes")?;
-    }
-    #[cfg(feature = "store-helix-only")]
-    {
-        helix_rebuild_chunks(
+    helix_rebuild_chunks(
             &helix_pack_path_for_local(pack_dir),
             &next_docs,
             manifest.embedding.dimension,
         )
         .context("failed to rebuild helix store")?;
-    }
+    helix_clear_entity_map(pack_dir);
     save_file_state(pack_dir, &next_states).context("failed to persist file state")?;
 
     let mut ontology = OntologyEngine::new(pack_dir)?;
-    #[cfg(feature = "lance-falkor")]
-    if let Some(socket_path) = socket_from_env() {
-        let graph_name = graph_name_override
-            .map(String::from)
-            .unwrap_or_else(graph_name_from_env);
-        let deleted_paths: Vec<String> = previous_paths
-            .difference(&seen_paths)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut paths_to_refresh = updated_paths.into_iter().collect::<Vec<_>>();
-        paths_to_refresh.extend(deleted_paths);
-
-        if !paths_to_refresh.is_empty() {
-            if let Err(e) = delete_chunks_for_paths(&socket_path, &graph_name, &paths_to_refresh) {
-                crate::term::warn(format!("warning: failed deleting stale graph chunks: {e}"));
-            }
-        }
-
-        if !changed_docs.is_empty() {
-            let graph_chunks = changed_docs
-                .iter()
-                .map(|doc| {
-                    let extraction = ontology.extract(&doc.content_hash, &doc.content, 12);
-                    ChunkGraphPayload {
-                        chunk_id: doc.chunk_id.clone(),
-                        file_path: doc.source_path.clone(),
-                        chunk_index: doc.chunk_index,
-                        content_hash: doc.content_hash.clone(),
-                        content: doc.content.clone(),
-                        entities: extraction.entities,
-                        relations: extraction.relations,
-                    }
-                })
-                .collect::<Vec<_>>();
-            if let Err(e) = upsert_chunks(&socket_path, &graph_name, &graph_chunks) {
-                crate::term::warn(format!("warning: failed writing chunks to falkor: {e}"));
-            }
-        }
-    }
-    #[cfg(feature = "store-helix-only")]
-    {
-        let mut all_entities = HashSet::new();
-        let mut total_relationships = 0usize;
+    let mut all_entities = HashSet::new();
+        let mut all_relations = Vec::new();
         for doc in &next_docs {
             let extraction = ontology.extract(&doc.content_hash, &doc.content, 12);
             for e in &extraction.entities {
                 all_entities.insert(e.clone());
             }
-            total_relationships += extraction.relations.len();
+            all_relations.extend(extraction.relations.clone());
         }
-        if let Err(e) = helix_write_graph_stats(pack_dir, all_entities.len(), total_relationships) {
+        let path = helix_pack_path_for_local(pack_dir);
+        let mut entity_map = helix_load_entity_id_map(pack_dir);
+        if let Err(e) =
+            helix_write_entities_edges(&path, pack_dir, &mut entity_map, &all_entities, &all_relations)
+        {
+            crate::term::warn(format!("warning: failed writing entities/edges to helix: {}", e));
+        }
+        if let Err(e) = helix_write_graph_stats(pack_dir, entity_map.len(), all_relations.len()) {
             crate::term::warn(format!("warning: failed writing graph stats: {}", e));
         }
-    }
 
     let mut source_contents: HashMap<String, Vec<String>> = HashMap::new();
     let mut source_hashes: HashMap<String, Vec<String>> = HashMap::new();

@@ -34,27 +34,11 @@ pub fn synthesize_answer(query: &str, response: &QueryResponse) -> Result<(Strin
     let prompt_inner = build_prompt_inner(query, response);
     let config = LlmConfig::from_env();
 
-    // #region agent log
-    let env_result = std::env::var("OPENAI_API_KEY");
-    let (has_key, key_len, no_key_reason) = match &env_result {
-        Ok(k) => (true, k.len(), Option::<String>::None),
-        Err(e) => (false, 0, Some(e.to_string())),
-    };
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-    let line = serde_json::json!({"sessionId":"ef491a","timestamp":ts,"location":"query_synth.rs:synthesize_answer","message":"OPENAI_API_KEY check","data":{"has_key":has_key,"key_len":key_len,"no_key_reason":no_key_reason},"hypothesisId":"A"});
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line).unwrap_or_default() + "\n").as_bytes()));
-    // #endregion
-
     // Prefer OpenAI when OPENAI_API_KEY is set; fall back to embedded model on failure or when no key.
-    if let Ok(api_key) = env_result {
+    if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
         if !api_key.trim().is_empty() {
             let model = std::env::var("MEMKIT_OPENAI_MODEL")
                 .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string());
-            // #region agent log
-            let ts2 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            let line2 = serde_json::json!({"sessionId":"ef491a","timestamp":ts2,"location":"query_synth.rs:synthesize_answer","message":"attempting OpenAI","data":{"model":&model},"hypothesisId":"C"});
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line2).unwrap_or_default() + "\n").as_bytes()));
-            // #endregion
             match openai_completion(&prompt_inner, config.max_tokens, &model, &api_key) {
                 Ok(out) => {
                     let answer = if std::env::var("MEMKIT_QUERY_RAW_ANSWER").as_deref() == Ok("1") {
@@ -64,28 +48,10 @@ pub fn synthesize_answer(query: &str, response: &QueryResponse) -> Result<(Strin
                     };
                     return Ok((answer, QueryProvider::OpenAI(model)));
                 }
-                Err(e) => {
-                    // #region agent log
-                    let ts3 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                    let line3 = serde_json::json!({"sessionId":"ef491a","timestamp":ts3,"location":"query_synth.rs:synthesize_answer","message":"OpenAI failed, falling back","data":{"err":e.to_string()},"hypothesisId":"C"});
-                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line3).unwrap_or_default() + "\n").as_bytes()));
-                    // #endregion
-                }
+                Err(_) => {}
             }
-        } else {
-            // #region agent log
-            let ts4 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            let line4 = serde_json::json!({"sessionId":"ef491a","timestamp":ts4,"location":"query_synth.rs:synthesize_answer","message":"key empty after trim","data":{},"hypothesisId":"B"});
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line4).unwrap_or_default() + "\n").as_bytes()));
-            // #endregion
         }
     }
-
-    // #region agent log
-    let ts5 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-    let line5 = serde_json::json!({"sessionId":"ef491a","timestamp":ts5,"location":"query_synth.rs:synthesize_answer","message":"using Llama path","data":{},"hypothesisId":"D"});
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line5).unwrap_or_default() + "\n").as_bytes()));
-    // #endregion
 
     if !std::path::Path::new(&config.model).exists() {
         anyhow::bail!(

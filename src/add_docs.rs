@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -5,16 +6,11 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::embed::provider_from_name;
-#[cfg(feature = "lance-falkor")]
-use crate::falkor_store::{
-    graph_name_for_pack, socket_from_env, upsert_chunks, ChunkGraphPayload,
-};
 use crate::indexer::{chunk_text, content_hash};
-#[cfg(feature = "lance-falkor")]
-use crate::lancedb_store::{append_docs, ensure_chunk_ids, rebuild_tables};
-#[cfg(feature = "store-helix-only")]
-use crate::helix_store::{helix_append_chunks, helix_pack_path_for_local, helix_rebuild_chunks};
-#[cfg(feature = "lance-falkor")]
+use crate::helix_store::{
+    helix_append_chunks, helix_load_entity_id_map, helix_pack_path_for_local, helix_rebuild_chunks,
+    helix_write_entities_edges, helix_write_graph_stats,
+};
 use crate::ontology::OntologyEngine;
 use crate::pack::load_manifest;
 use crate::types::SourceDoc;
@@ -90,49 +86,33 @@ pub fn run_add(
 
     let dim = manifest.embedding.dimension;
 
-    #[cfg(feature = "lance-falkor")]
-    {
-        ensure_chunk_ids(&mut new_docs);
-        let db_path = pack_dir.join("lancedb");
-        if db_path.exists() {
-            append_docs(pack_dir, &new_docs, dim).context("failed to append to lancedb")?;
-        } else {
-            rebuild_tables(pack_dir, &new_docs, dim).context("failed to rebuild lancedb tables")?;
-        }
-        if let Some(socket_path) = socket_from_env() {
-            if let Ok(graph_name) = graph_name_for_pack(pack_dir) {
-                let mut ontology = OntologyEngine::new(pack_dir)?;
-                let graph_chunks: Vec<ChunkGraphPayload> = new_docs
-                    .iter()
-                    .map(|doc| {
-                        let extraction = ontology.extract(&doc.content_hash, &doc.content, 12);
-                        ChunkGraphPayload {
-                            chunk_id: doc.chunk_id.clone(),
-                            file_path: doc.source_path.clone(),
-                            chunk_index: doc.chunk_index,
-                            content_hash: doc.content_hash.clone(),
-                            content: doc.content.clone(),
-                            entities: extraction.entities,
-                            relations: extraction.relations,
-                        }
-                    })
-                    .collect();
-                if let Err(e) = upsert_chunks(&socket_path, &graph_name, &graph_chunks) {
-                    crate::term::warn(format!("warning: failed writing add chunks to falkor: {e}"));
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "store-helix-only")]
-    {
-        let path = helix_pack_path_for_local(pack_dir);
+    let path = helix_pack_path_for_local(pack_dir);
         if path.exists() {
             helix_append_chunks(&path, &new_docs, dim).context("failed to append to helix")?;
         } else {
             helix_rebuild_chunks(&path, &new_docs, dim).context("failed to rebuild helix store")?;
+            crate::helix_store::helix_clear_entity_map(pack_dir);
         }
-    }
+        let mut ontology = OntologyEngine::new(pack_dir)?;
+        let mut all_entities = HashSet::new();
+        let mut all_relations = Vec::new();
+        for doc in &new_docs {
+            let extraction = ontology.extract(&doc.content_hash, &doc.content, 12);
+            for e in &extraction.entities {
+                all_entities.insert(e.clone());
+            }
+            all_relations.extend(extraction.relations.clone());
+        }
+        let (_existing_entities, existing_rels) = crate::helix_store::helix_graph_counts(pack_dir);
+        let mut entity_map = helix_load_entity_id_map(pack_dir);
+        helix_write_entities_edges(&path, pack_dir, &mut entity_map, &all_entities, &all_relations)
+            .context("failed to write entities/edges to helix")?;
+        helix_write_graph_stats(
+            pack_dir,
+            entity_map.len(),
+            existing_rels + all_relations.len(),
+        )?;
+        let _ = ontology.save();
 
     Ok(new_docs.len())
 }

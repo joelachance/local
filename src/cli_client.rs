@@ -1,145 +1,11 @@
-use std::fs;
-use std::io::{Read, Seek, Write};
-use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Child, Command};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use fs2::FileExt;
 use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 
 use crate::term;
-
-// --- Session refcount and PID file (~/.memkit) ---
-
-fn memkit_dir() -> Result<PathBuf> {
-    dirs::home_dir()
-        .context("home directory not available")
-        .map(|h| h.join(".memkit"))
-}
-
-fn refcount_path() -> Result<PathBuf> {
-    Ok(memkit_dir()?.join("cli-refcount"))
-}
-
-fn server_pid_path() -> Result<PathBuf> {
-    Ok(memkit_dir()?.join("server.pid"))
-}
-
-fn refcount_inc() -> Result<()> {
-    let dir = memkit_dir()?;
-    fs::create_dir_all(&dir).context("create ~/.memkit")?;
-    let path = refcount_path()?;
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .context("open refcount file")?;
-    f.lock_exclusive().context("lock refcount file")?;
-    let mut s = String::new();
-    f.read_to_string(&mut s).context("read refcount")?;
-    let n: u32 = s.trim().parse().unwrap_or(0);
-    f.set_len(0).context("truncate refcount")?;
-    f.rewind().context("rewind refcount")?;
-    write!(f, "{}", n + 1).context("write refcount")?;
-    f.unlock().context("unlock refcount")?;
-    Ok(())
-}
-
-fn refcount_dec() -> Result<u32> {
-    let path = refcount_path()?;
-    let mut f = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .context("open refcount file")?;
-    f.lock_exclusive().context("lock refcount file")?;
-    let mut s = String::new();
-    f.read_to_string(&mut s).context("read refcount")?;
-    let n: u32 = s.trim().parse().unwrap_or(0);
-    let new_n = n.saturating_sub(1);
-    f.set_len(0).context("truncate refcount")?;
-    f.rewind().context("rewind refcount")?;
-    write!(f, "{}", new_n).context("write refcount")?;
-    f.unlock().context("unlock refcount")?;
-    Ok(new_n)
-}
-
-fn pid_write(pid: u32) -> Result<()> {
-    let dir = memkit_dir()?;
-    fs::create_dir_all(&dir).context("create ~/.memkit")?;
-    let path = server_pid_path()?;
-    fs::write(&path, pid.to_string()).context("write server.pid")?;
-    Ok(())
-}
-
-fn pid_remove() {
-    let _ = server_pid_path().and_then(|p| fs::remove_file(p).map_err(anyhow::Error::from));
-}
-
-fn pid_read_and_kill() {
-    let path = match server_pid_path() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let s = match fs::read_to_string(&path) {
-        Ok(x) => x,
-        Err(_) => return,
-    };
-    let pid: u32 = match s.trim().parse() {
-        Ok(x) => x,
-        Err(_) => return,
-    };
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
-    }
-    let _ = fs::remove_file(&path);
-}
-
-/// Guard for a server process started by the CLI. Call `shutdown()` when done so the child is killed and reaped (when refcount hits 0).
-pub struct ServerGuard {
-    child: Option<Child>,
-    /// Some only for ensure_server (shared port); None for ensure_server_standalone (Index).
-    session_refcounted: Option<()>,
-}
-
-impl ServerGuard {
-    /// Decrement refcount if we're on the shared path; if refcount reaches 0, kill our child or the PID in ~/.memkit/server.pid.
-    pub fn shutdown(mut self) -> Result<()> {
-        if self.session_refcounted.take().is_some() {
-            let count = refcount_dec()?;
-            if count == 0 {
-                if let Some(mut child) = self.child.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    pid_remove();
-                } else {
-                    pid_read_and_kill();
-                }
-            }
-            // count > 0: another CLI is still using the server; drop child without killing
-        } else {
-            // Standalone (Index): always kill our child
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        if self.session_refcounted.take().is_some() {
-            let _ = refcount_dec();
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -204,119 +70,19 @@ async fn server_is_up(cfg: &ServerConfig) -> bool {
     }
 }
 
-const HEALTH_POLL_INTERVAL_MS: u64 = 300;
-const HEALTH_POLL_ATTEMPTS: usize = 200; // 200 * 300ms = 60s total
-
-fn spawn_server(cfg: &ServerConfig, packs: &[PathBuf]) -> Result<Child> {
-    let exe = std::env::current_exe().context("failed to get current executable")?;
-    let pack_paths: String = packs
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut cmd = Command::new(&exe);
-    cmd.arg("--headless-serve")
-        .arg("--pack")
-        .arg(&pack_paths)
-        .arg("--host")
-        .arg(&cfg.host)
-        .arg("--port")
-        .arg(cfg.port.to_string())
-        .env("API_PORT", cfg.port.to_string())
-        .env("MEMKIT_PACK_PATHS", &pack_paths);
-    if let Ok(v) = std::env::var("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON") {
-        cmd.env("MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON", v);
-    }
-    if let Ok(v) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
-        cmd.env("GOOGLE_APPLICATION_CREDENTIALS", v);
-    }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let child = cmd.spawn().with_context(|| {
-        format!(
-            "failed to start server ({}). try a different port or ensure no other process is using it",
-            exe.display()
-        )
-    })?;
-    Ok(child)
-}
-
-fn find_free_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("find free port")?;
-    Ok(listener.local_addr().context("local_addr")?.port())
-}
-
-pub async fn ensure_server(cfg: &ServerConfig, packs: &[PathBuf]) -> Result<ServerGuard> {
-    refcount_inc()?;
+/// Ensure the server is running; return an error with instructions if not. Does not start the server.
+pub async fn require_server(cfg: &ServerConfig) -> Result<()> {
     if server_is_up(cfg).await {
-        return Ok(ServerGuard {
-            child: None,
-            session_refcounted: Some(()),
-        });
+        return Ok(());
     }
-    let mut child = match spawn_server(cfg, packs) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = refcount_dec();
-            return Err(e);
-        }
-    };
-    for _ in 0..HEALTH_POLL_ATTEMPTS {
-        tokio::time::sleep(Duration::from_millis(HEALTH_POLL_INTERVAL_MS)).await;
-        if server_is_up(cfg).await {
-            pid_write(child.id()).context("write server.pid")?;
-            return Ok(ServerGuard {
-                child: Some(child),
-                session_refcounted: Some(()),
-            });
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = refcount_dec();
     Err(anyhow!(
-        "server did not become healthy after {}s on {}:{}. try a different port or ensure no other process is using it",
-        (HEALTH_POLL_ATTEMPTS as u64 * HEALTH_POLL_INTERVAL_MS) / 1000,
+        "Server not running at {}:{}. Start it with 'mk serve' (or 'mk serve --pack <path>' to specify packs).",
         cfg.host,
         cfg.port
     ))
 }
 
-/// Start a server on an ephemeral port (no reuse of existing server). Use for index so our process creates the pack.
-pub async fn ensure_server_standalone(
-    cfg: &ServerConfig,
-    packs: &[PathBuf],
-) -> Result<(ServerGuard, ServerConfig)> {
-    let port = find_free_port()?;
-    let standalone_cfg = ServerConfig {
-        host: cfg.host.clone(),
-        port,
-    };
-    let mut child = spawn_server(&standalone_cfg, packs)?;
-    for _ in 0..HEALTH_POLL_ATTEMPTS {
-        tokio::time::sleep(Duration::from_millis(HEALTH_POLL_INTERVAL_MS)).await;
-        if server_is_up(&standalone_cfg).await {
-            return Ok((
-                ServerGuard {
-                    child: Some(child),
-                    session_refcounted: None,
-                },
-                standalone_cfg,
-            ));
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(anyhow!(
-        "server did not become healthy after {}s on {}:{}",
-        (HEALTH_POLL_ATTEMPTS as u64 * HEALTH_POLL_INTERVAL_MS) / 1000,
-        standalone_cfg.host,
-        standalone_cfg.port
-    ))
-}
-
-/// Poll /status until the index job is no longer active (or timeout). Use after POST /index when the CLI started the server.
+/// Poll /status until the index job is no longer active (or timeout). Use after POST /index.
 pub async fn poll_until_index_done(cfg: &ServerConfig, pack_path: &str) -> Result<()> {
     const POLL_INTERVAL: Duration = Duration::from_secs(2);
     const MAX_WAIT: Duration = Duration::from_secs(7200); // 2 hours
@@ -364,13 +130,24 @@ pub fn print_status(data: &Value) {
     let entities = data.get("entities").and_then(Value::as_u64).unwrap_or(0) as usize;
     let relationships = data.get("relationships").and_then(Value::as_u64).unwrap_or(0) as usize;
     let file_tree = data.get("file_tree").and_then(Value::as_str).unwrap_or("");
+    let pending_removal = data.get("pending_removal").and_then(Value::as_bool).unwrap_or(false);
+    let pending_add = data.get("pending_add").and_then(Value::as_bool).unwrap_or(false);
     let jobs = data.get("jobs").and_then(Value::as_object);
     let active_job = jobs.and_then(|j| j.get("active")).map(|v| !v.is_null()).unwrap_or(false);
     let active_job_id = jobs.and_then(|j| j.get("active")).and_then(Value::as_object).and_then(|o| o.get("id")).and_then(Value::as_str);
     let queued_jobs = jobs.and_then(|j| j.get("queued_jobs")).and_then(Value::as_array).map(|a| a.as_slice()).unwrap_or(&[]);
+    let last_job = jobs.and_then(|j| j.get("last_completed")).and_then(Value::as_object);
+    let last_job_failed = last_job.and_then(|j| j.get("state")).and_then(Value::as_str) == Some("Failed");
+    let last_job_error = last_job.and_then(|j| j.get("error")).and_then(Value::as_str);
+    let last_job_id = last_job.and_then(|j| j.get("id")).and_then(Value::as_str);
 
     if term::color_stdout() {
-        if active_job {
+        if pending_removal {
+            println!("{} {}", pack_path.bold(), "removing...".yellow());
+        } else if pending_add {
+            let id = active_job_id.unwrap_or("?");
+            println!("{} {} {}", pack_path.bold(), id.dimmed(), "...pending".yellow());
+        } else if active_job {
             let id = active_job_id.unwrap_or("?");
             println!("{} {} {}", pack_path.bold(), id.dimmed(), "...pending".yellow());
         } else if indexed {
@@ -398,8 +175,16 @@ pub fn print_status(data: &Value) {
                 println!("  {} {}", id.dimmed(), "...pending".yellow());
             }
         }
+        if !indexed && last_job_failed {
+            if let Some(err) = last_job_error {
+                let id = last_job_id.unwrap_or("job");
+                println!("  {} {}", id.dimmed(), format!("failed: {}", err).red());
+            }
+        }
     } else {
-        if active_job {
+        if pending_removal {
+            println!("{} removing...", pack_path);
+        } else if pending_add || active_job {
             let id = active_job_id.unwrap_or("?");
             println!("{} {} ...pending", pack_path, id);
         } else if indexed {
@@ -420,10 +205,17 @@ pub fn print_status(data: &Value) {
                 println!("  {} ...pending", id);
             }
         }
+        if !indexed && last_job_failed {
+            if let Some(err) = last_job_error {
+                let id = last_job_id.unwrap_or("job");
+                println!("  {} failed: {}", id, err);
+            }
+        }
     }
 }
 
 pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
+    let _ = crate::registry::ensure_default_if_unset();
     let reg = crate::registry::load_registry().unwrap_or_default();
     if reg.packs.is_empty() {
         let data = status(cfg, None).await?;
@@ -462,11 +254,18 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
 
     if !output_json {
         let home_canon = dirs::home_dir().and_then(|h| h.canonicalize().ok());
+        let default_path = reg.default_path.as_deref();
         for p in &reg.packs {
             let default_marker = if p.default { " (default)" } else { "" };
             let path_is_home = PathBuf::from(&p.path).canonicalize().ok().as_ref() == home_canon.as_ref();
             let path_display = if path_is_home { "~/.memkit" } else { p.path.as_str() };
-            let (lead, path_part) = if let Some(ref name) = p.name {
+            let is_default_pack = p.default
+                || default_path == Some(p.path.as_str())
+                || (reg.packs.len() == 1)
+                || (path_is_home && default_path.is_none());
+            let (lead, path_part) = if is_default_pack {
+                ("default", path_display)
+            } else if let Some(ref name) = p.name {
                 (name.as_str(), path_display)
             } else {
                 (path_display, "")
@@ -534,8 +333,16 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
                 let relationships = data.get("relationships").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let counts_suffix = format!("{} vectors, {} entities, {} relationships", vector_count, entities, relationships);
                 let active_obj = active_job.and_then(Value::as_object);
-                let is_remove_job_for_this_pack = active_obj.as_ref().and_then(|o| o.get("job_type").and_then(Value::as_str)) == Some("remove_pack")
-                    && active_obj.as_ref().and_then(|o| o.get("pack_path").and_then(Value::as_str)) == Some(p.path.as_str());
+                let remove_for_pack = |j: &Value| {
+                    j.get("job_type").and_then(Value::as_str) == Some("remove_pack")
+                        && j.get("pack_path").and_then(Value::as_str) == Some(p.path.as_str())
+                };
+                let is_remove_for_active = active_obj.as_ref().map_or(false, |o| {
+                    o.get("job_type").and_then(Value::as_str) == Some("remove_pack")
+                        && o.get("pack_path").and_then(Value::as_str) == Some(p.path.as_str())
+                });
+                let is_remove_job_for_this_pack =
+                    is_remove_for_active || queued_jobs.iter().any(remove_for_pack);
                 let status_line = if is_remove_job_for_this_pack {
                     "removing...".to_string()
                 } else if let Some(ref obj) = active_obj {
@@ -583,21 +390,6 @@ pub async fn index(cfg: &ServerConfig, path: &str, name: Option<&str>, dry_run: 
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        // #region agent log
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let line = serde_json::json!({"sessionId":"14a764","location":"cli_client.rs:index","message":"index non-2xx","data":{"path":path,"status":status.as_u16(),"body":body},"timestamp":ts,"hypothesisId":"C"});
-        for log_path in [
-            "/Users/joe/git/local/.cursor/debug-14a764.log",
-            "/Users/joe/git/local/debug-14a764.log",
-            "debug-14a764.log",
-        ] {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                let _ = writeln!(f, "{}", line);
-                let _ = f.flush();
-                break;
-            }
-        }
-        // #endregion
         let hint = if body.contains("INDEX_HOME_REFUSED") {
             "Use the mk binary from this repo and stop any old server: (1) lsof -i :4242 then kill <pid> (2) from repo root: cargo run -- mk add <path>"
         } else {
@@ -654,7 +446,22 @@ pub async fn query(cfg: &ServerConfig, args: &QueryArgs, pack: Option<&str>) -> 
     if let Some(p) = pack {
         body["pack"] = json!(p);
     }
-    let resp = client.post(url).json(&body).send().await?;
+    let resp = match client.post(url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            let connection_error = msg.contains("connection closed")
+                || msg.contains("connection refused")
+                || msg.contains("failed to connect");
+            return Err(if connection_error {
+                anyhow!(e).context(
+                    "Could not reach the memkit server. Is it running? Try 'mk serve' or run a command that starts it (e.g. mk query).",
+                )
+            } else {
+                anyhow!(e)
+            });
+        }
+    };
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
@@ -727,8 +534,16 @@ pub async fn add(cfg: &ServerConfig, body: &serde_json::Value) -> Result<Value> 
     serde_json::from_str(&resp_body).context("parse add response")
 }
 
-/// Print "Adding … (job-N). Run 'mk status' to check progress." when add response has status accepted and job id.
+/// Print add result: "Added N chunks." when synchronous success, or "Adding (job-N)..." when async job.
 pub fn print_add_started(data: &Value, pack_path: &str) {
+    if let Some(n) = data.get("result").and_then(|r| r.get("chunks_added")).and_then(Value::as_u64) {
+        if term::color_stdout() {
+            println!("{} {}", "Added".green(), format!("{} chunks.", n).cyan());
+        } else {
+            println!("Added {} chunks.", n);
+        }
+        return;
+    }
     if let Some(job_id) = data.get("job").and_then(|j| j.get("id")).and_then(Value::as_str) {
         if term::color_stdout() {
             println!(

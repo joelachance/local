@@ -18,16 +18,8 @@ use crate::google::{
     self, fetch_doc_content, fetch_sheet_content, get_access_token, parse_doc_id, parse_sheet_ids,
     GoogleAuthenticator,
 };
-#[cfg(feature = "lance-falkor")]
-use crate::falkor_store::{
-    graph_counts as falkor_graph_counts, graph_name_for_pack, graph_name_from_env,
-    graph_schema as falkor_graph_schema, graph_subgraph as falkor_graph_subgraph,
-};
 use crate::indexer::run_index;
 use crate::file_tree::format_file_tree;
-#[cfg(feature = "lance-falkor")]
-use crate::lancedb_store::load_all_docs;
-#[cfg(feature = "store-helix-only")]
 use crate::helix_store::{
     helix_load_all_docs, helix_graph_counts, helix_pack_path_for_local, remove_helix_for_pack,
 };
@@ -38,16 +30,13 @@ use crate::pack::{
 use crate::pack_location::PackLocation;
 use crate::publish::{publish_pack_to_s3, PublishDestination};
 use crate::memkit_txt::ensure_memkit_txt;
-use crate::registry::{pack_dir_for_path, ensure_registered, remove_pack_by_path};
+use crate::registry::{pack_dir_for_path, ensure_registered, remove_pack_by_path, resolve_pack_by_name_or_path};
 use crate::query::{run_query, run_query_multi};
-use crate::query_synth::synthesize_answer;
+use crate::query_synth::{synthesize_answer, QueryProvider};
 use crate::types::SourceDoc;
 
 fn load_pack_docs(pack: &Path, dim: usize) -> anyhow::Result<Vec<SourceDoc>> {
-    #[cfg(feature = "store-helix-only")]
-    return helix_load_all_docs(&helix_pack_path_for_local(pack), dim);
-    #[cfg(feature = "lance-falkor")]
-    return load_all_docs(pack, dim);
+    helix_load_all_docs(&helix_pack_path_for_local(pack), dim)
 }
 
 /// Optional Google integration (service account). When set, google_doc / google_sheet document types are supported.
@@ -60,8 +49,6 @@ struct GoogleAuthState {
 #[derive(Clone)]
 struct AppState {
     packs: Arc<Vec<PathBuf>>,
-    falkordb_socket: Option<String>,
-    falkor_graph: String,
     jobs: Arc<Mutex<JobRegistry>>,
     google: Option<Arc<GoogleAuthState>>,
     google_load_error: Option<String>,
@@ -71,6 +58,8 @@ struct AppState {
 #[serde(rename_all = "snake_case")]
 enum JobType {
     IndexSources,
+    /// New pack: copy dir into sources, register, then run index. Job stays active for entire flow.
+    IndexNewPack,
     AddDocuments,
     RemovePack,
 }
@@ -200,15 +189,6 @@ struct AddRequest {
     conversation: Option<Vec<AddConversationMessage>>,
 }
 
-#[derive(Deserialize)]
-struct SubgraphRequest {
-    query: String,
-    #[serde(default = "default_depth")]
-    depth: usize,
-    #[serde(default = "default_limit")]
-    limit: usize,
-}
-
 fn default_top_k() -> usize {
     8
 }
@@ -217,27 +197,12 @@ fn default_use_reranker() -> bool {
     true
 }
 
-fn default_depth() -> usize {
-    2
-}
-
-fn default_limit() -> usize {
-    25
-}
-
 #[derive(Serialize)]
 struct HealthResponse {
     status: String,
-    falkordb_socket: Option<String>,
-    falkordb_connected: Option<bool>,
 }
 
-pub async fn run_server(
-    packs: Vec<PathBuf>,
-    host: String,
-    port: u16,
-    falkordb_socket: Option<String>,
-) -> Result<()> {
+pub async fn run_server(packs: Vec<PathBuf>, host: String, port: u16) -> Result<()> {
     if packs.is_empty() {
         anyhow::bail!("at least one pack path required");
     }
@@ -251,33 +216,8 @@ pub async fn run_server(
         }
         Err(e) => (None, Some(e.to_string())),
     };
-    // #region agent log
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-085e7a.log") {
-        let err_preview = google_load_error.as_deref().map(|s| if s.len() > 200 { format!("{}...", &s[..200]) } else { s.to_string() }).unwrap_or_default();
-        let data = serde_json::json!({
-            "sessionId": "085e7a",
-            "location": "server.rs:run_server after google load",
-            "message": "google state",
-            "data": { "google_ok": google.is_some(), "google_load_error_preview": err_preview },
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-            "hypothesisId": "H1 H4 H5"
-        });
-        let _ = std::io::Write::write_fmt(&mut f, format_args!("{}\n", data.to_string()));
-    }
-    // #endregion
     let state = AppState {
         packs: Arc::new(packs),
-        falkordb_socket,
-        falkor_graph: {
-            #[cfg(feature = "lance-falkor")]
-            {
-                graph_name_from_env()
-            }
-            #[cfg(feature = "store-helix-only")]
-            {
-                String::new()
-            }
-        },
         jobs: Arc::new(Mutex::new(JobRegistry::new())),
         google,
         google_load_error,
@@ -287,18 +227,6 @@ pub async fn run_server(
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/graph/view", get(graph_view))
-        .merge({
-            #[cfg(feature = "lance-falkor")]
-            {
-                Router::new()
-                    .route("/graph/schema", get(graph_schema))
-                    .route("/graph/subgraph", post(graph_subgraph))
-            }
-            #[cfg(feature = "store-helix-only")]
-            {
-                Router::new()
-            }
-        })
         .route("/google/service-account-email", get(google_service_account_email))
         .route("/query", post(query))
         .route("/index", post(index_now))
@@ -328,49 +256,13 @@ async fn google_service_account_email(
     Ok(Json(json!({ "email": google.client_email })))
 }
 
-async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
-    let socket_path = state.falkordb_socket.clone();
-    let connected = if let Some(ref path) = socket_path {
-        // Timeout so /health never blocks: UnixStream::connect can block if FalkorDB is not running.
-        let path = path.to_string();
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || can_connect_to_socket(&path)),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
-        Some(r)
-    } else {
-        None
-    };
-    let ok = connected.unwrap_or(true);
-    let status = if ok { "ok" } else { "degraded" }.to_string();
-    let code = if ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
+async fn health(State(_state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     (
-        code,
+        StatusCode::OK,
         Json(HealthResponse {
-            status,
-            falkordb_socket: socket_path,
-            falkordb_connected: connected,
+            status: "ok".to_string(),
         }),
     )
-}
-
-#[cfg(unix)]
-fn can_connect_to_socket(path: &str) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
-}
-
-#[cfg(not(unix))]
-fn can_connect_to_socket(_path: &str) -> bool {
-    false
 }
 
 async fn status(
@@ -379,37 +271,74 @@ async fn status(
 ) -> Json<Value> {
     let (pack_str, sources, vector_count, indexed, file_paths, pack_for_helix) =
         if let Some(ref path) = q.path {
-            let dir = PathBuf::from(path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(path));
-            // Per-dir layout: index creates <dir>/.memkit and writes vectors to helix under that pack path.
-            // Always use dir.join(".memkit") so we read from the same place the indexer wrote.
-            let pack = if dir.join(".memkit/manifest.json").exists() {
-                dir.join(".memkit")
-            } else if dir.join("manifest.json").exists() {
-                dir.clone()
-            } else {
-                dir.join(".memkit")
-            };
-            let manifest = load_manifest(&pack).ok();
-            let docs = manifest
-                .as_ref()
-                .and_then(|m| load_pack_docs(&pack, m.embedding.dimension).ok())
-                .unwrap_or_default();
-            let vector_count = docs.len();
-            let indexed = vector_count > 0;
-            let mut file_paths: Vec<String> = docs.iter().map(|d| d.source_path.clone()).collect();
-            file_paths.sort_unstable();
-            file_paths.dedup();
-            let sources = manifest.map(|m| m.sources).unwrap_or_default();
-            (
-                pack.display().to_string(),
-                sources,
-                vector_count,
-                indexed,
-                file_paths,
-                Some(pack),
-            )
+            // Resolve as pack name (registry) first, then as filesystem path.
+            match resolve_pack_by_name_or_path(path) {
+                Ok(pack_root) => {
+                    // If path was already the pack dir (manifest.json here), use it; else pack_root is parent of .memkit.
+                    let pack_dir = if pack_root.join("manifest.json").exists() {
+                        pack_root.clone()
+                    } else {
+                        pack_dir_for_path(&pack_root)
+                    };
+                    let manifest = load_manifest(&pack_dir).ok();
+                    let docs = manifest
+                        .as_ref()
+                        .and_then(|m| load_pack_docs(&pack_dir, m.embedding.dimension).ok())
+                        .unwrap_or_default();
+                    let mut file_paths: Vec<String> = docs.iter().map(|d| d.source_path.clone()).collect();
+                    file_paths.sort_unstable();
+                    file_paths.dedup();
+                    let sources = manifest.map(|m| m.sources).unwrap_or_default();
+                    let vector_count = docs.len();
+                    let indexed = vector_count > 0;
+                    let display = if dirs::home_dir().as_ref().and_then(|h| h.canonicalize().ok()).as_ref()
+                        == pack_root.canonicalize().as_ref().ok()
+                    {
+                        "~/.memkit".to_string()
+                    } else {
+                        pack_root.display().to_string()
+                    };
+                    (
+                        display,
+                        sources,
+                        vector_count,
+                        indexed,
+                        file_paths,
+                        Some(pack_dir),
+                    )
+                }
+                Err(_) => {
+                    let dir = PathBuf::from(path)
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(path));
+                    let pack = if dir.join(".memkit/manifest.json").exists() {
+                        dir.join(".memkit")
+                    } else if dir.join("manifest.json").exists() {
+                        dir.clone()
+                    } else {
+                        dir.join(".memkit")
+                    };
+                    let manifest = load_manifest(&pack).ok();
+                    let docs = manifest
+                        .as_ref()
+                        .and_then(|m| load_pack_docs(&pack, m.embedding.dimension).ok())
+                        .unwrap_or_default();
+                    let vector_count = docs.len();
+                    let indexed = vector_count > 0;
+                    let mut file_paths: Vec<String> = docs.iter().map(|d| d.source_path.clone()).collect();
+                    file_paths.sort_unstable();
+                    file_paths.dedup();
+                    let sources = manifest.map(|m| m.sources).unwrap_or_default();
+                    (
+                        pack.display().to_string(),
+                        sources,
+                        vector_count,
+                        indexed,
+                        file_paths,
+                        Some(pack),
+                    )
+                }
+            }
         } else {
             let mut all_sources = Vec::new();
             let mut all_paths = Vec::new();
@@ -452,23 +381,10 @@ async fn status(
             )
         };
 
-    let (entities, relationships) = {
-        #[cfg(feature = "lance-falkor")]
-        {
-            state
-                .falkordb_socket
-                .as_ref()
-                .and_then(|sock| falkor_graph_counts(sock, &state.falkor_graph).ok())
-                .unwrap_or((0, 0))
-        }
-        #[cfg(feature = "store-helix-only")]
-        {
-            pack_for_helix
-                .as_ref()
-                .map(|p| helix_graph_counts(p.as_path()))
-                .unwrap_or((0, 0))
-        }
-    };
+    let (entities, relationships) = pack_for_helix
+        .as_ref()
+        .map(|p| helix_graph_counts(p.as_path()))
+        .unwrap_or((0, 0));
     let base_path: String = state
         .packs
         .first()
@@ -503,6 +419,42 @@ async fn status(
         (active, last, queued_list)
     };
 
+    let (pending_removal, pending_add) = if q.path.is_some() {
+        let canonical_root = pack_for_helix
+            .as_ref()
+            .and_then(|pack_dir| {
+                pack_dir
+                    .parent()
+                    .map(PathBuf::from)
+                    .or_else(|| Some(pack_dir.clone()))
+                    .and_then(|p| p.canonicalize().ok())
+                    .map(|p| p.to_string_lossy().to_string())
+            });
+        match &canonical_root {
+            Some(root) => {
+                let root = root.as_str();
+                let active_remove = active_job.as_ref().map_or(false, |j| {
+                    matches!(j.job_type, JobType::RemovePack) && j.pack_path.as_deref() == Some(root)
+                });
+                let queued_remove = queued_list.iter().any(|j| {
+                    j.get("job_type").and_then(Value::as_str) == Some("remove_pack")
+                        && j.get("pack_path").and_then(Value::as_str) == Some(root)
+                });
+                let active_add = active_job.as_ref().map_or(false, |j| {
+                    matches!(j.job_type, JobType::AddDocuments) && j.pack_path.as_deref() == Some(root)
+                });
+                let queued_add = queued_list.iter().any(|j| {
+                    j.get("job_type").and_then(Value::as_str) == Some("add_documents")
+                        && j.get("pack_path").and_then(Value::as_str) == Some(root)
+                });
+                (active_remove || queued_remove, active_add || queued_add)
+            }
+            None => (false, false),
+        }
+    } else {
+        (false, false)
+    };
+
     let pack_paths: Vec<String> = state.packs.iter().map(|p| {
         let is_home = dirs::home_dir().as_ref().and_then(|h| h.canonicalize().ok()).as_ref() == p.canonicalize().as_ref().ok();
         if is_home { "~/.memkit".to_string() } else { p.display().to_string() }
@@ -517,6 +469,8 @@ async fn status(
         "relationships": relationships,
         "file_tree": file_tree,
         "sources": sources,
+        "pending_removal": pending_removal,
+        "pending_add": pending_add,
         "jobs": {
             "active": active_job,
             "last_completed": last_job,
@@ -524,57 +478,6 @@ async fn status(
             "queued_jobs": queued_list
         }
     }))
-}
-
-#[cfg(feature = "lance-falkor")]
-async fn graph_schema(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(socket_path) = state.falkordb_socket.clone() else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({"error":{"code":"FALKOR_UNAVAILABLE","message":"FALKORDB_SOCKET is not configured"}}),
-            ),
-        ));
-    };
-
-    match falkor_graph_schema(&socket_path, &state.falkor_graph) {
-        Ok(schema) => Ok(Json(schema)),
-        Err(e) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"code":"GRAPH_SCHEMA_FAILED","message":e.to_string()}})),
-        )),
-    }
-}
-
-#[cfg(feature = "lance-falkor")]
-async fn graph_subgraph(
-    State(state): State<AppState>,
-    Json(req): Json<SubgraphRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(socket_path) = state.falkordb_socket.clone() else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({"error":{"code":"FALKOR_UNAVAILABLE","message":"FALKORDB_SOCKET is not configured"}}),
-            ),
-        ));
-    };
-
-    match falkor_graph_subgraph(
-        &socket_path,
-        &state.falkor_graph,
-        &req.query,
-        req.depth,
-        req.limit,
-    ) {
-        Ok(graph) => Ok(Json(graph)),
-        Err(e) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"code":"GRAPH_SUBGRAPH_FAILED","message":e.to_string()}})),
-        )),
-    }
 }
 
 async fn graph_view() -> Html<&'static str> {
@@ -643,39 +546,35 @@ async fn graph_view() -> Html<&'static str> {
     )
 }
 
+/// Query flow: (1) Retrieval: run_query() loads pack docs, embeds the query, and runs vector search
+/// (Helix: helix_hybrid_query, or LanceDB+Falkor). Returns QueryResponse with results (top chunks).
+/// (2) Synthesis: unless req.raw, synthesize_answer() builds a prompt from top chunks and runs the LLM
+/// (Llama) to produce a short answer. Use ?raw=true or --raw to skip synthesis and get retrieval-only.
 async fn query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let resp_result = if let Some(ref path) = req.pack {
-        let loc = if path.starts_with("s3://") {
-            PackLocation::from_s3_uri(path).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error":{"code":"INVALID_PACK","message":e.to_string()}})),
-                )
-            })?
+        if path.starts_with("s3://") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"code":"INVALID_PACK","message":"S3 pack paths are not supported in this build"}})),
+            ));
+        }
+        let dir = PathBuf::from(path);
+        let pack = if dir.join(".memkit/manifest.json").exists() {
+            dir.join(".memkit")
+        } else if dir.join("manifest.json").exists() {
+            dir
         } else {
-            let dir = PathBuf::from(path);
-            let pack = if dir.join(".memkit/manifest.json").exists() {
-                dir.join(".memkit")
-            } else if dir.join("manifest.json").exists() {
-                dir
-            } else {
-                state.packs.first().cloned().unwrap_or_else(|| dir)
-            };
-            PackLocation::local(pack)
+            state.packs.first().cloned().unwrap_or_else(|| dir)
         };
-        #[cfg(feature = "lance-falkor")]
-        let graph_name = loc.as_path().and_then(|p| graph_name_for_pack(p).ok());
-        #[cfg(feature = "store-helix-only")]
-        let graph_name: Option<String> = None;
+        let loc = PackLocation::local(pack);
         run_query(
             &loc,
             &req.query,
             req.top_k,
             req.use_reranker,
-            graph_name.as_deref(),
             req.path_filter.as_deref(),
         )
     } else if state.packs.len() > 1 {
@@ -695,45 +594,56 @@ async fn query(
             &req.query,
             req.top_k,
             req.use_reranker,
-            None,
             req.path_filter.as_deref(),
         )
     };
 
     match resp_result {
         Ok(resp) => {
+            let mut by_path: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
+            for h in &resp.results {
+                by_path
+                    .entry(h.file_path.clone())
+                    .and_modify(|s| *s = (*s).max(h.score))
+                    .or_insert(h.score);
+            }
+            let mut sources: Vec<_> = by_path
+                .into_iter()
+                .map(|(path, score)| json!({ "path": path, "score": score }))
+                .collect();
+            sources.sort_by(|a, b| {
+                let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
             if req.raw {
                 Ok(Json(json!(resp)))
             } else {
                 match synthesize_answer(&req.query, &resp) {
                     Ok((answer, provider)) => {
-                        let mut by_path: std::collections::HashMap<String, f32> =
-                            std::collections::HashMap::new();
-                        for h in &resp.results {
-                            by_path
-                                .entry(h.file_path.clone())
-                                .and_modify(|s| *s = (*s).max(h.score))
-                                .or_insert(h.score);
-                        }
-                        let mut sources: Vec<_> = by_path
-                            .into_iter()
-                            .map(|(path, score)| json!({ "path": path, "score": score }))
-                            .collect();
-                        sources.sort_by(|a, b| {
-                            let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        let model = match &provider {
+                            QueryProvider::OpenAI(m) => m.clone(),
+                            QueryProvider::Llama => "qwen-2.5".to_string(),
+                        };
                         Ok(Json(json!({
                             "answer": answer,
                             "sources": sources,
-                            "provider": provider.label()
+                            "provider": provider.label(),
+                            "model": model,
+                            "retrieval_results": resp.retrieval_results
                         })))
                     }
-                    Err(e) => Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error":{"code":"SYNTHESIS_FAILED","message":e.to_string()}})),
-                    )),
+                    Err(e) => {
+                        Ok(Json(json!({
+                            "answer": serde_json::Value::Null,
+                            "synthesis_error": e.to_string(),
+                            "sources": sources,
+                            "results": resp.results,
+                            "retrieval_results": resp.retrieval_results
+                        })))
+                    }
                 }
             }
         }
@@ -821,8 +731,7 @@ async fn index_now(
     Json(req): Json<IndexRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(path) = req.path {
-        use std::ffi::OsStr;
-        // Validate path and pack so we can fail fast; heavy work (copy) runs in background.
+        // Validate path and pack so we can fail fast; heavy work runs in job.
         let dir = PathBuf::from(&path)
             .canonicalize()
             .map_err(|e| {
@@ -831,17 +740,7 @@ async fn index_now(
                     Json(json!({"error":{"code":"PATH_INVALID","message":format!("path not accessible: {}", e)}})),
                 )
             })?;
-        // #region agent log
         let has_manifest = dir.join("manifest.json").exists();
-        let home_canon = dirs::home_dir().as_ref().and_then(|h| h.canonicalize().ok());
-        let is_home = home_canon.as_ref() == Some(&dir);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-14a764.log") {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-            let _ = writeln!(f, "{}", serde_json::json!({"sessionId":"14a764","location":"server.rs:index_now","message":"index request","data":{"path":path,"dir":dir.to_string_lossy().to_string(),"has_manifest":has_manifest,"is_home":is_home},"timestamp":ts,"hypothesisId":"B"}));
-            let _ = f.flush();
-        }
-        // #endregion
         // When path is an existing pack dir (has manifest.json): enqueue index for that pack (no copy).
         if has_manifest {
             let pack_dir = dir;
@@ -899,39 +798,13 @@ async fn index_now(
                     )
                 })?;
         }
-        let path = dir.to_string_lossy().to_string();
+        let dir_path = dir.to_string_lossy().to_string();
         let name = req.name.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            let dir = PathBuf::from(&path);
-            let pack_dir = pack_dir_for_path(&dir);
-            let normalized = path.clone();
-            let _ = ensure_memkit_txt(&dir);
-            let source_name = dir
-                .file_name()
-                .unwrap_or_else(|| OsStr::new("unnamed"))
-                .to_string_lossy();
-            let outcome = match copy_dir_into_sources(&dir, &pack_dir, &source_name) {
-                Ok(o) => o,
-                Err(_) => return,
-            };
-            if add_source_root(&pack_dir, &outcome.source_root).is_err() {
-                return;
-            }
-            let reg = crate::registry::load_registry().unwrap_or_default();
-            let is_first = reg.packs.is_empty();
-            let _ = ensure_registered(&normalized, name, is_first);
-            let cleanup = outcome.cleanup_after_index.as_ref().map(|p| {
-                (p.to_string_lossy().to_string(), pack_dir.to_string_lossy().to_string())
-            });
-            let pack_to_index = Some(pack_dir.to_string_lossy().to_string());
-            let job = enqueue_index_job(&state, "manual_index", pack_to_index, cleanup).await;
-            start_next_job_if_idle(state);
-            let _ = job;
-        });
+        let job = enqueue_index_new_pack_job(&state, dir_path, name).await;
+        start_next_job_if_idle(state.clone());
         return Ok(Json(json!({
             "status": "accepted",
-            "job": { "id": "pending" }
+            "job": job
         })));
     }
 
@@ -1019,6 +892,36 @@ async fn enqueue_index_job(
     json!(record)
 }
 
+/// Enqueue a job that sets up a new pack (copy, register) then runs index. Returns real job id so CLI can poll.
+async fn enqueue_index_new_pack_job(
+    state: &AppState,
+    dir_path: String,
+    name: Option<String>,
+) -> Value {
+    let mut jobs = state.jobs.lock().await;
+    let id = format!("job-{}", jobs.next_id);
+    jobs.next_id += 1;
+    let add_payload = name.map(|n| json!({ "name": n }));
+    let record = JobRecord {
+        id: id.clone(),
+        job_type: JobType::IndexNewPack,
+        state: JobState::Queued,
+        trigger: "manual_index".to_string(),
+        pack_path: Some(dir_path),
+        cleanup_after_index: None,
+        add_payload,
+        enqueued_at: Utc::now(),
+        started_at: None,
+        finished_at: None,
+        result: None,
+        error: None,
+    };
+    jobs.queue.push_back(id.clone());
+    jobs.jobs.push(record.clone());
+    drop(jobs);
+    json!(record)
+}
+
 async fn enqueue_remove_job(state: &AppState, pack_root: String) -> Value {
     let mut jobs = state.jobs.lock().await;
     let id = format!("job-{}", jobs.next_id);
@@ -1049,6 +952,10 @@ fn start_next_job_if_idle(state: AppState) {
                 packs: Vec<PathBuf>,
                 cleanup: Option<(String, String)>,
             },
+            IndexNewPack {
+                dir_path: PathBuf,
+                name: Option<String>,
+            },
             Add {
                 pack_path: PathBuf,
                 items: Vec<(String, String)>,
@@ -1078,6 +985,19 @@ fn start_next_job_if_idle(state: AppState) {
                         .unwrap_or_else(PathBuf::new);
                     JobWork::RemovePack { pack_root }
                 }
+                Some(j) if matches!(j.job_type, JobType::IndexNewPack) => {
+                    let dir_path = j
+                        .pack_path
+                        .as_ref()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(PathBuf::new);
+                    let name = j
+                        .add_payload
+                        .as_ref()
+                        .and_then(|p| p.get("name").and_then(Value::as_str))
+                        .map(String::from);
+                    JobWork::IndexNewPack { dir_path, name }
+                }
                 Some(j) if matches!(j.job_type, JobType::AddDocuments) => {
                     let pack_path = j.pack_path.as_ref().map(PathBuf::from).unwrap_or_else(PathBuf::new);
                     let items: Vec<(String, String)> = j
@@ -1097,6 +1017,7 @@ fn start_next_job_if_idle(state: AppState) {
                     JobWork::Add { pack_path, items }
                 }
                 _ => {
+                    // IndexSources or any other job type treated as index (pack_path from job or all packs).
                     let pack_path = job.as_ref().and_then(|j| j.pack_path.clone());
                     let cleanup = job.as_ref().and_then(|j| j.cleanup_after_index.clone());
                     let packs: Vec<PathBuf> = pack_path
@@ -1112,6 +1033,38 @@ fn start_next_job_if_idle(state: AppState) {
         };
 
         let run_outcome: Result<(Value, Option<(String, String)>), (anyhow::Error, Option<(String, String)>)> = match work {
+            JobWork::IndexNewPack { dir_path, name } => {
+                let run_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                    use std::ffi::OsStr;
+                    let pack_dir = pack_dir_for_path(&dir_path);
+                    let _ = ensure_memkit_txt(&dir_path);
+                    let source_name = dir_path
+                        .file_name()
+                        .unwrap_or_else(|| OsStr::new("unnamed"))
+                        .to_string_lossy();
+                    let outcome = copy_dir_into_sources(&dir_path, &pack_dir, &source_name)?;
+                    add_source_root(&pack_dir, &outcome.source_root)?;
+                    let normalized = dir_path.canonicalize()?.to_string_lossy().to_string();
+                    let reg = crate::registry::load_registry().unwrap_or_default();
+                    let is_first = reg.packs.is_empty();
+                    ensure_registered(&normalized, name, is_first)?;
+                    let manifest = load_manifest(&pack_dir)?;
+                    let sources = resolve_source_roots(&pack_dir, &manifest);
+                    let (scanned, updated, chunks) =
+                        run_index(&pack_dir, &sources)?;
+                    Ok(json!({
+                        "scanned": scanned,
+                        "updated_files": updated,
+                        "chunks": chunks
+                    }))
+                })
+                .await;
+                match run_result {
+                    Ok(Ok(v)) => Ok((v, None)),
+                    Ok(Err(e)) => Err((e, None)),
+                    Err(e) => Err((anyhow::anyhow!("job task failed: {}", e), None)),
+                }
+            }
             JobWork::Index { packs: packs_to_index, cleanup: cleanup_after_index } => {
                 let run_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
                     let mut total_scanned = 0usize;
@@ -1121,12 +1074,8 @@ fn start_next_job_if_idle(state: AppState) {
                     for pack in &packs_to_index {
                         let manifest = load_manifest(pack)?;
                         let sources = resolve_source_roots(pack, &manifest);
-                        #[cfg(feature = "lance-falkor")]
-                        let graph_name = if _multi { graph_name_for_pack(pack).ok() } else { None };
-                        #[cfg(feature = "store-helix-only")]
-                        let graph_name: Option<String> = None;
                         let (scanned, updated, chunks) =
-                            run_index(pack, &sources, graph_name.as_deref())?;
+                            run_index(pack, &sources)?;
                         total_scanned += scanned;
                         total_updated += updated;
                         total_chunks += chunks;
@@ -1165,7 +1114,6 @@ fn start_next_job_if_idle(state: AppState) {
             }
             JobWork::RemovePack { pack_root } => {
                 let run_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-                    #[cfg(feature = "store-helix-only")]
                     remove_helix_for_pack(&pack_root)?;
                     remove_pack_by_path(&pack_root)?;
                     scrub_pack_from_dir(&pack_root)?;
@@ -1243,7 +1191,7 @@ async fn add_now(
         state
             .packs
             .first()
-            .cloned()
+            .map(|r| pack_dir_for_path(r))
             .ok_or((
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error":{"code":"NO_PACK","message":"no pack configured"}})),
@@ -1383,43 +1331,48 @@ async fn add_now(
         ));
     }
 
-    let pack_path = pack_dir.display().to_string();
-    let add_payload = json!({
-        "pack_path": pack_path,
-        "items": items
-            .iter()
-            .map(|(content, source_path)| json!({ "content": content, "source_path": source_path }))
-            .collect::<Vec<_>>()
-    });
-    let job = enqueue_add_job(&state, &pack_path, add_payload).await;
-    start_next_job_if_idle(state.clone());
-    Ok(Json(json!({
-        "status": "accepted",
-        "job": job
-    })))
-}
+    let pack_path = pack_dir.clone();
+    let items_clone: Vec<(String, String)> = items
+        .iter()
+        .map(|(c, s)| (c.clone(), s.clone()))
+        .collect();
+    let run_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let mut total_chunks = 0usize;
+        for (content, source_path) in &items_clone {
+            let n = run_add(&pack_path, content, source_path)?;
+            total_chunks += n;
+        }
+        Ok(json!({
+            "status": "ok",
+            "chunks_added": total_chunks
+        }))
+    })
+    .await;
 
-async fn enqueue_add_job(state: &AppState, pack_path: &str, add_payload: Value) -> Value {
-    let mut jobs = state.jobs.lock().await;
-    let id = format!("job-{}", jobs.next_id);
-    jobs.next_id += 1;
-    let record = JobRecord {
-        id: id.clone(),
-        job_type: JobType::AddDocuments,
-        state: JobState::Queued,
-        trigger: "add".to_string(),
-        pack_path: Some(pack_path.to_string()),
-        cleanup_after_index: None,
-        add_payload: Some(add_payload),
-        enqueued_at: Utc::now(),
-        started_at: None,
-        finished_at: None,
-        result: None,
-        error: None,
-    };
-    jobs.queue.push_back(id);
-    jobs.jobs.push(record.clone());
-    json!(record)
+    match run_result {
+        Ok(Ok(v)) => Ok(Json(json!({
+            "status": "ok",
+            "result": v
+        }))),
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": { "code": "ADD_FAILED", "message": msg }
+                })),
+            ))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": { "code": "ADD_TASK_FAILED", "message": msg }
+                })),
+            ))
+        }
+    }
 }
 
 async fn mcp(
@@ -1476,7 +1429,7 @@ async fn mcp(
                         run_query_multi(&pack_dirs, &query, top_k, use_reranker, None)
                     } else {
                         let p = pack_dirs.first().unwrap();
-                        run_query(&PackLocation::local(p), &query, top_k, use_reranker, None, None)
+                        run_query(&PackLocation::local(p), &query, top_k, use_reranker, None)
                     };
                     match resp {
                         Ok(r) => json!({

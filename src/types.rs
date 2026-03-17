@@ -101,6 +101,9 @@ pub struct QueryResponse {
     pub grouped_results: Vec<QueryGroup>,
     #[serde(default)]
     pub timings_ms: QueryTimings,
+    /// Raw hits from vector store (e.g. Helix) before rerank/truncation, for debugging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_results: Option<Vec<QueryHit>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

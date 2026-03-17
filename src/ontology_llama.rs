@@ -130,10 +130,6 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
                 // Only truncate when prompt exceeds context; keep start (instructions + question + context beginning).
                 prompt_tokens = prompt_tokens[..max_prompt_tokens].to_vec();
             }
-            // #region agent log
-            let ts_tok = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-be211f.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&serde_json::json!({"sessionId":"be211f","timestamp":ts_tok,"location":"ontology_llama.rs:run_completion after tokenize","message":"prompt tokens","data":{"n_tokens":prompt_tokens.len(),"n_ctx":n_ctx,"max_prompt_tokens":max_prompt_tokens,"truncated":truncated},"hypothesisId":"H3"})).unwrap_or_default() + "\n").as_bytes()));
-            // #endregion
 
             let n_batch = ctx.n_batch() as usize;
             let mut batch = LlamaBatch::new(
@@ -195,10 +191,6 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
             }
 
             if out.trim().is_empty() {
-                // #region agent log
-                let ts_empty = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-be211f.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&serde_json::json!({"sessionId":"be211f","timestamp":ts_empty,"location":"ontology_llama.rs:run_completion","message":"llama output was empty","data":{"out_len":out.len()},"hypothesisId":"H4"})).unwrap_or_default() + "\n").as_bytes()));
-                // #endregion
                 return Err(anyhow!("llama output was empty"));
             }
             Ok(out)
@@ -206,11 +198,6 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
 
         #[cfg(not(feature = "llama-embedded"))]
         {
-            // #region agent log
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            let line = serde_json::json!({"sessionId":"ef491a","timestamp":ts,"location":"ontology_llama.rs:run_completion","message":"llama-cli","data":{"model":&self.config.model,"max_tokens":max_tokens},"hypothesisId":"C"});
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line).unwrap_or_default() + "\n").as_bytes()));
-            // #endregion
             let llama_cli = resolve_llama_cli_path(&self.config.model);
             if !llama_cli.exists() && llama_cli.file_name().and_then(|n| n.to_str()) == Some("llama-cli") {
                 return Err(anyhow!(
@@ -230,16 +217,6 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
             {
                 Ok(o) => o,
                 Err(e) => {
-                    // #region agent log
-                    let err_msg = if e.kind() == std::io::ErrorKind::NotFound {
-                        format!("llama-cli not found (tried {})", llama_cli.display())
-                    } else {
-                        format!("failed to execute llama-cli: {}", e)
-                    };
-                    let ts_err = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                    let line_err = serde_json::json!({"sessionId":"be211f","timestamp":ts_err,"location":"ontology_llama.rs:run_completion","message":"llama-cli spawn failed","data":{"llama_cli":llama_cli.display().to_string(),"err":err_msg},"hypothesisId":"H1"});
-                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-be211f.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line_err).unwrap_or_default() + "\n").as_bytes()));
-                    // #endregion
                     return Err(if e.kind() == std::io::ErrorKind::NotFound {
                         anyhow!(
                             "llama-cli not found (tried {}). Set MEMKIT_LLAMA_CLI to the full path, or build with --features llama-embedded for in-process inference.",
@@ -250,19 +227,7 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
                     });
                 }
             };
-            // #region agent log
-            let stderr_preview = String::from_utf8_lossy(&output.stderr);
-            let stderr_trim = if stderr_preview.len() > 500 { format!("{}...", &stderr_preview[..500]) } else { stderr_preview.to_string() };
-            let ts2 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            let line2 = serde_json::json!({"sessionId":"ef491a","timestamp":ts2,"location":"ontology_llama.rs:run_completion","message":"llama-cli result","data":{"success":output.status.success(),"code":output.status.code(),"stdout_len":output.stdout.len(),"stderr_preview":stderr_trim},"hypothesisId":"C"});
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-ef491a.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line2).unwrap_or_default() + "\n").as_bytes()));
-            // #endregion
             if !output.status.success() {
-                // #region agent log
-                let ts_fail = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                let line_fail = serde_json::json!({"sessionId":"be211f","timestamp":ts_fail,"location":"ontology_llama.rs:run_completion","message":"llama-cli non-zero exit","data":{"code":output.status.code(),"stdout_len":output.stdout.len(),"stderr_preview":stderr_trim},"hypothesisId":"H1"});
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-be211f.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line_fail).unwrap_or_default() + "\n").as_bytes()));
-                // #endregion
                 return Err(anyhow!(
                     "llama-cli fallback failed with status {} (enable `llama-embedded` feature for in-process mode)",
                     output.status.code().unwrap_or(-1)
@@ -270,11 +235,6 @@ Keep at most {max_entities} entities and at most 24 relations. Output JSON only.
             }
             let text = String::from_utf8_lossy(&output.stdout).to_string();
             if text.trim().is_empty() {
-                // #region agent log
-                let ts_empty = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                let line_empty = serde_json::json!({"sessionId":"be211f","timestamp":ts_empty,"location":"ontology_llama.rs:run_completion","message":"llama-cli empty stdout","data":{},"hypothesisId":"H4"});
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/joe/git/local/.cursor/debug-be211f.log").and_then(|mut f| std::io::Write::write_all(&mut f, (serde_json::to_string(&line_empty).unwrap_or_default() + "\n").as_bytes()));
-                // #endregion
                 return Err(anyhow!("llama-cli fallback produced empty output"));
             }
             Ok(text)
