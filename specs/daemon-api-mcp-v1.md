@@ -1,5 +1,9 @@
 # Daemon API and MCP Contract V1.1
 
+> Legacy spec note: this document contains older `satori`/`7821` contract details.
+> Current memkit runtime defaults to `127.0.0.1:4242` and is documented in `README.md`.
+> Error responses are `{ "error": { "code", "message" } }` in the current server implementation.
+
 This document aligns daemon behavior with the command-first runtime contract and explicit watch lifecycle management.
 
 ## Runtime

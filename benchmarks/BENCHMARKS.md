@@ -1,5 +1,8 @@
 # Satori Benchmarks
 
+> Legacy doc note: benchmark text below still references `satori` and older architecture assumptions.
+> Current CLI binary is `mk`; current defaults and APIs are in `README.md`.
+
 ## Context
 
 Satori indexes **documents** (files, markdown, code) into a memory pack, but the primary use case is **conversational and multi-turn**: users query memory through the CLI (`satori query`) and, more commonly, through the **SDK** when integrating with AI clients. Each query in a conversation may depend on prior turns; benchmarks must reflect this retrieval-in-conversation reality.

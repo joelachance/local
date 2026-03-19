@@ -1,5 +1,9 @@
 # CLI Specification V1.1 (Command-First)
 
+> Legacy spec note: this file documents an older `satori` command set.
+> Current implementation uses the `mk` binary and commands documented in `README.md`.
+> Key deltas: no `init/index/watch` commands, default server port is `4242`, and storage is Helix-backed.
+
 This document supersedes earlier CLI guidance that treated non-command interfaces as primary.
 
 ## Binary

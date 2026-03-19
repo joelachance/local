@@ -1,5 +1,8 @@
 # Architecture V1.1: Local Memory Pack (Command-First)
 
+> Legacy spec note: this architecture references older `satori` naming and LanceDB-centric flows.
+> Current implementation is `memkit` (`mk`) with Helix-backed local storage.
+
 ## System Overview
 
 V1.1 is a local-first Rust system with three runtime surfaces:
