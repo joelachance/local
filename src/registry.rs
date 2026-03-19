@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use crate::pack::has_manifest_at;
 
 const REGISTRY_DIR: &str = ".memkit";
 const REGISTRY_FILE: &str = "registry.json";
@@ -218,7 +219,7 @@ pub fn resolve_pack_by_name_or_path(arg: &str) -> Result<PathBuf> {
         let path = PathBuf::from(path)
             .canonicalize()
             .context("default pack path no longer exists")?;
-        if path.join(".memkit/manifest.json").exists() || path.join("manifest.json").exists() {
+        if has_manifest_at(&path) {
             return Ok(path);
         }
         anyhow::bail!("default pack path {} has no manifest", path.display());
@@ -228,7 +229,7 @@ pub fn resolve_pack_by_name_or_path(arg: &str) -> Result<PathBuf> {
         let path = PathBuf::from(&p.path)
             .canonicalize()
             .context("registry pack path no longer exists")?;
-        if path.join(".memkit/manifest.json").exists() || path.join("manifest.json").exists() {
+        if has_manifest_at(&path) {
             return Ok(path);
         }
         anyhow::bail!("pack \"{}\" path {} has no manifest", arg, path.display());
@@ -236,10 +237,7 @@ pub fn resolve_pack_by_name_or_path(arg: &str) -> Result<PathBuf> {
     let path = PathBuf::from(arg)
         .canonicalize()
         .with_context(|| format!("pack path not found: {}", arg))?;
-    if path.join(".memkit/manifest.json").exists() {
-        return Ok(path);
-    }
-    if path.join("manifest.json").exists() {
+    if has_manifest_at(&path) {
         return Ok(path);
     }
     Err(anyhow::anyhow!("no memory pack at {}", path.display()))

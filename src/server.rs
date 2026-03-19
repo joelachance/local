@@ -24,13 +24,13 @@ use crate::helix_store::{
     helix_load_all_docs, helix_graph_counts, helix_pack_path_for_local, remove_helix_for_pack,
 };
 use crate::pack::{
-    add_source_root, copy_dir_into_sources, init_pack, load_manifest, remove_source_root,
-    resolve_source_roots, scrub_pack_from_dir,
+    add_source_root, copy_dir_into_sources, has_manifest_at, init_pack, load_manifest,
+    remove_source_root, resolve_pack_dir, resolve_source_roots, scrub_pack_from_dir,
 };
 use crate::pack_location::PackLocation;
 use crate::publish::{publish_pack_to_s3, PublishDestination};
 use crate::memkit_txt::ensure_memkit_txt;
-use crate::registry::{pack_dir_for_path, ensure_registered, remove_pack_by_path, resolve_pack_by_name_or_path};
+use crate::registry::{pack_dir_for_path, ensure_registered, load_registry, remove_pack_by_path, resolve_pack_by_name_or_path};
 use crate::query::{run_query, run_query_multi};
 use crate::query_synth::{synthesize_answer, QueryProvider};
 use crate::types::SourceDoc;
@@ -148,13 +148,6 @@ struct StatusQuery {
 }
 
 #[derive(Deserialize, Default)]
-struct IndexRequest {
-    path: Option<String>,
-    /// Optional pack name for registry (default: random word).
-    name: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
 struct RemoveRequest {
     path: Option<String>,
 }
@@ -182,9 +175,12 @@ struct AddConversationMessage {
 
 #[derive(Deserialize, Default)]
 struct AddRequest {
-    /// Pack path (directory that contains the pack, or path to .memkit). If omitted, use first pack.
+    /// Pack path when adding documents/conversation. When adding a directory (no documents/conversation), this is the content path (directory or file to add).
     #[serde(default)]
     path: Option<String>,
+    /// Pack override: pack root path or name. When adding a directory, which pack to add to (default: first pack or ~).
+    #[serde(default)]
+    pack: Option<String>,
     documents: Option<Vec<AddDocumentItem>>,
     conversation: Option<Vec<AddConversationMessage>>,
 }
@@ -229,7 +225,6 @@ pub async fn run_server(packs: Vec<PathBuf>, host: String, port: u16) -> Result<
         .route("/graph/view", get(graph_view))
         .route("/google/service-account-email", get(google_service_account_email))
         .route("/query", post(query))
-        .route("/index", post(index_now))
         .route("/remove", post(remove_now))
         .route("/add", post(add_now))
         .route("/publish", post(publish))
@@ -275,11 +270,7 @@ async fn status(
             match resolve_pack_by_name_or_path(path) {
                 Ok(pack_root) => {
                     // If path was already the pack dir (manifest.json here), use it; else pack_root is parent of .memkit.
-                    let pack_dir = if pack_root.join("manifest.json").exists() {
-                        pack_root.clone()
-                    } else {
-                        pack_dir_for_path(&pack_root)
-                    };
+                    let pack_dir = resolve_pack_dir(&pack_root);
                     let manifest = load_manifest(&pack_dir).ok();
                     let docs = manifest
                         .as_ref()
@@ -311,13 +302,7 @@ async fn status(
                     let dir = PathBuf::from(path)
                         .canonicalize()
                         .unwrap_or_else(|_| PathBuf::from(path));
-                    let pack = if dir.join(".memkit/manifest.json").exists() {
-                        dir.join(".memkit")
-                    } else if dir.join("manifest.json").exists() {
-                        dir.clone()
-                    } else {
-                        dir.join(".memkit")
-                    };
+                    let pack = resolve_pack_dir(&dir);
                     let manifest = load_manifest(&pack).ok();
                     let docs = manifest
                         .as_ref()
@@ -562,12 +547,10 @@ async fn query(
             ));
         }
         let dir = PathBuf::from(path);
-        let pack = if dir.join(".memkit/manifest.json").exists() {
-            dir.join(".memkit")
-        } else if dir.join("manifest.json").exists() {
-            dir
+        let pack = if has_manifest_at(&dir) {
+            resolve_pack_dir(&dir)
         } else {
-            state.packs.first().cloned().unwrap_or_else(|| dir)
+            state.packs.first().cloned().unwrap_or(dir)
         };
         let loc = PackLocation::local(pack);
         run_query(
@@ -587,7 +570,12 @@ async fn query(
             req.path_filter.as_deref(),
         )
     } else {
-        let pack_root = state.packs.first().unwrap();
+        let Some(pack_root) = state.packs.first() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"code":"NO_PACK","message":"no pack configured"}})),
+            ));
+        };
         let pack_dir = pack_dir_for_path(pack_root);
         run_query(
             &PackLocation::local(&pack_dir),
@@ -667,13 +655,7 @@ async fn publish(
                     Json(json!({"error":{"code":"PATH_INVALID","message":format!("path not accessible: {}", e)}})),
                 )
             })?;
-        if dir.join("manifest.json").exists() {
-            dir
-        } else if dir.join(".memkit/manifest.json").exists() {
-            dir.join(".memkit")
-        } else {
-            pack_dir_for_path(&dir)
-        }
+        resolve_pack_dir(&dir)
     } else {
         state
             .packs
@@ -699,7 +681,12 @@ async fn publish(
                     Json(json!({"error":{"code":"INVALID_DESTINATION","message":"destination must be s3://bucket/prefix"}})),
                 ));
             }
-            let rest = uri.strip_prefix("s3://").unwrap();
+            let Some(rest) = uri.strip_prefix("s3://") else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":{"code":"INVALID_DESTINATION","message":"destination must be s3://bucket/prefix"}})),
+                ));
+            };
             let (bucket, prefix) = match rest.find('/') {
                 Some(i) => (
                     rest[..i].to_string(),
@@ -726,94 +713,74 @@ async fn publish(
     }
 }
 
-async fn index_now(
-    State(state): State<AppState>,
-    Json(req): Json<IndexRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if let Some(path) = req.path {
-        // Validate path and pack so we can fail fast; heavy work runs in job.
-        let dir = PathBuf::from(&path)
+/// Resolve pack root for "add directory": pack override or first pack. Used when we may create the pack.
+fn resolve_pack_root_for_add(
+    state: &AppState,
+    pack_override: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+    let root = if let Some(p) = pack_override {
+        PathBuf::from(p).canonicalize().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"code":"PATH_INVALID","message":format!("pack path not accessible: {}", e)}})),
+            )
+        })?
+    } else {
+        state.packs.first().cloned().ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":"NO_PACK","message":"no pack configured"}})),
+        ))?
+    };
+    Ok(root)
+}
+
+/// Resolve pack dir for documents/conversation add: path (pack path) or pack override or first pack.
+fn resolve_pack_dir_for_docs(
+    state: &AppState,
+    path: Option<&str>,
+    pack_override: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+    if let Some(p) = pack_override {
+        let root = PathBuf::from(p)
             .canonicalize()
             .map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error":{"code":"PATH_INVALID","message":format!("path not accessible: {}", e)}})),
+                    Json(json!({"error":{"code":"PATH_INVALID","message":format!("pack path not accessible: {}", e)}})),
                 )
             })?;
-        let has_manifest = dir.join("manifest.json").exists();
-        // When path is an existing pack dir (has manifest.json): enqueue index for that pack (no copy).
-        if has_manifest {
-            let pack_dir = dir;
-            let job = enqueue_index_job(
-                &state,
-                "manual_index",
-                Some(pack_dir.to_string_lossy().to_string()),
-                None,
-            )
-            .await;
-            start_next_job_if_idle(state.clone());
-            return Ok(Json(json!({
-                "status": "accepted",
-                "job": job
-            })));
-        }
-        let pack_dir = pack_dir_for_path(&dir);
-        // When path is home directory: only enqueue index job for the pack at ~/.memkit (no copy, no new source).
-        let is_home = dirs::home_dir()
-            .as_ref()
-            .and_then(|h| h.canonicalize().ok())
-            .as_ref()
-            == Some(&dir);
-        if is_home {
-            if !pack_dir.join("manifest.json").exists() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": {
-                            "code": "PACK_NOT_FOUND",
-                            "message": "No pack at ~/.memkit. Run 'mk add <path>' first to create the default pack."
-                        }
-                    })),
-                ));
-            }
-            let job = enqueue_index_job(
-                &state,
-                "manual_index",
-                Some(pack_dir.to_string_lossy().to_string()),
-                None,
-            )
-            .await;
-            start_next_job_if_idle(state.clone());
-            return Ok(Json(json!({
-                "status": "accepted",
-                "job": job
-            })));
-        }
-        if !pack_dir.join("manifest.json").exists() {
-            init_pack(&pack_dir, false, "fastembed", "BAAI/bge-small-en-v1.5", 384)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error":{"code":"INIT_FAILED","message":e.to_string()}})),
-                    )
-                })?;
-        }
-        let dir_path = dir.to_string_lossy().to_string();
-        let name = req.name.clone();
-        let job = enqueue_index_new_pack_job(&state, dir_path, name).await;
-        start_next_job_if_idle(state.clone());
-        return Ok(Json(json!({
-            "status": "accepted",
-            "job": job
-        })));
+        return Ok(resolve_pack_dir(&root));
     }
+    if let Some(path) = path {
+        let dir = PathBuf::from(path).canonicalize().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"code":"PATH_INVALID","message":format!("path not accessible: {}", e)}})),
+            )
+        })?;
+        let resolved = resolve_pack_dir(&dir);
+        return Ok(resolved);
+    }
+    state.packs.first().map(|r| pack_dir_for_path(r)).ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":{"code":"NO_PACK","message":"no pack configured"}})),
+    ))
+}
 
-    let job = enqueue_index_job(&state, "manual_index", None, None).await;
-    start_next_job_if_idle(state.clone());
-    Ok(Json(json!({
-        "status":"accepted",
-        "job": job
-    })))
+/// Create pack at pack_dir if manifest.json does not exist.
+fn ensure_pack_exists(pack_dir: &Path) -> anyhow::Result<()> {
+    if pack_dir.join("manifest.json").exists() {
+        return Ok(());
+    }
+    init_pack(pack_dir, false, "fastembed", "BAAI/bge-small-en-v1.5", 384)?;
+    let pack_root = pack_dir
+        .parent()
+        .unwrap_or_else(|| pack_dir)
+        .to_path_buf();
+    let normalized = pack_root.canonicalize()?.to_string_lossy().to_string();
+    let reg = load_registry().unwrap_or_default();
+    ensure_registered(&normalized, None, reg.packs.is_empty())?;
+    Ok(())
 }
 
 async fn remove_now(
@@ -837,13 +804,7 @@ async fn remove_now(
                 Json(json!({"error":{"code":"PATH_INVALID","message":format!("path not accessible: {}", e)}})),
             )
         })?;
-    let pack_dir = if dir.join(".memkit/manifest.json").exists() {
-        dir.join(".memkit")
-    } else if dir.join("manifest.json").exists() {
-        dir
-    } else {
-        pack_dir_for_path(&dir)
-    };
+    let pack_dir = resolve_pack_dir(&dir);
     if !pack_dir.join("manifest.json").exists() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1164,8 +1125,16 @@ async fn add_now(
     State(state): State<AppState>,
     Json(req): Json<AddRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let pack_dir = if let Some(ref path) = req.path {
-        let dir = PathBuf::from(path)
+    let has_content = req.documents.as_ref().map_or(false, |d| !d.is_empty())
+        || req.conversation.as_ref().map_or(false, |c| !c.is_empty());
+
+    if !has_content {
+        // Add directory (or file) mode: path = content to add, pack = optional pack override.
+        let content_path = req.path.as_deref().ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":"PATH_REQUIRED","message":"path required to add a directory or file"}})),
+        ))?;
+        let content = PathBuf::from(content_path)
             .canonicalize()
             .map_err(|e| {
                 (
@@ -1173,30 +1142,61 @@ async fn add_now(
                     Json(json!({"error":{"code":"PATH_INVALID","message":format!("path not accessible: {}", e)}})),
                 )
             })?;
-        let resolved = if dir.join("manifest.json").exists() {
-            dir
-        } else if dir.join(".memkit/manifest.json").exists() {
-            dir.join(".memkit")
-        } else {
-            pack_dir_for_path(&dir)
-        };
-        if !resolved.join("manifest.json").exists() {
+        let is_home = dirs::home_dir()
+            .as_ref()
+            .and_then(|h| h.canonicalize().ok())
+            .as_ref()
+            == Some(&content);
+        if is_home {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error":{"code":"PACK_INVALID","message":"manifest.json not found"}})),
+                Json(json!({
+                    "error": {
+                        "code": "ADD_HOME_REFUSED",
+                        "message": "Cannot add home directory as a source. Add specific directories (e.g. ~/Documents/...) instead."
+                    }
+                })),
             ));
         }
-        resolved
-    } else {
-        state
-            .packs
-            .first()
-            .map(|r| pack_dir_for_path(r))
-            .ok_or((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error":{"code":"NO_PACK","message":"no pack configured"}})),
-            ))?
-    };
+        let root_path = if content.is_dir() {
+            content.to_string_lossy().to_string()
+        } else {
+            content
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| content.to_string_lossy().to_string())
+        };
+        let pack_root = resolve_pack_root_for_add(&state, req.pack.as_deref())?;
+        let pack_dir = pack_dir_for_path(&pack_root);
+        ensure_pack_exists(&pack_dir).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":{"code":"INIT_FAILED","message":e.to_string()}})),
+            )
+        })?;
+        add_source_root(&pack_dir, &root_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":{"code":"ADD_SOURCE_FAILED","message":e.to_string()}})),
+            )
+        })?;
+        let pack_path_str = pack_dir.canonicalize().unwrap_or(pack_dir.clone()).to_string_lossy().to_string();
+        let job = enqueue_index_job(&state, "add", Some(pack_path_str), None).await;
+        start_next_job_if_idle(state.clone());
+        return Ok(Json(json!({
+            "status": "accepted",
+            "job": job
+        })));
+    }
+
+    // Documents/conversation mode: path (or pack) = pack location.
+    let pack_dir = resolve_pack_dir_for_docs(&state, req.path.as_deref(), req.pack.as_deref())?;
+    ensure_pack_exists(&pack_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":{"code":"INIT_FAILED","message":e.to_string()}})),
+        )
+    })?;
 
     let mut items: Vec<(String, String)> = Vec::new(); // (content, source_path)
 
@@ -1428,7 +1428,13 @@ async fn mcp(
                     let resp = if state.packs.len() > 1 {
                         run_query_multi(&pack_dirs, &query, top_k, use_reranker, None)
                     } else {
-                        let p = pack_dirs.first().unwrap();
+                        let Some(p) = pack_dirs.first() else {
+                            return Ok(Json(json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{"isError": true, "content":[{"type":"text","text":"no pack configured"}]}
+                            })));
+                        };
                         run_query(&PackLocation::local(p), &query, top_k, use_reranker, None)
                     };
                     match resp {

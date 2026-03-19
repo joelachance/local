@@ -16,6 +16,20 @@ pub fn manifest_path(pack_dir: &Path) -> PathBuf {
     pack_dir.join("manifest.json")
 }
 
+pub fn has_manifest_at(path: &Path) -> bool {
+    path.join("manifest.json").exists() || path.join(".memkit/manifest.json").exists()
+}
+
+pub fn resolve_pack_dir(path: &Path) -> PathBuf {
+    if path.join("manifest.json").exists() {
+        path.to_path_buf()
+    } else if path.join(".memkit/manifest.json").exists() {
+        path.join(".memkit")
+    } else {
+        path.join(".memkit")
+    }
+}
+
 pub fn state_path(pack_dir: &Path) -> PathBuf {
     pack_dir.join("state").join("file_state.json")
 }
@@ -73,7 +87,7 @@ pub fn load_manifest(pack_dir: &Path) -> Result<Manifest> {
 }
 
 pub fn load_manifest_from_loc(loc: &PackLocation) -> Result<Manifest> {
-    let bytes = loc.read_file("manifest.json").context("manifest.json missing; run `mk index <dir>`")?;
+    let bytes = loc.read_file("manifest.json").context("manifest.json missing; run `mk add <path>`")?;
     let manifest = serde_json::from_slice::<Manifest>(&bytes).context("invalid manifest.json")?;
     Ok(manifest)
 }

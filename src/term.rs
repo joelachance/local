@@ -23,3 +23,15 @@ pub fn warn(msg: impl Display) {
         eprintln!("{}", s);
     }
 }
+
+/// Apply stdout style when colors are enabled; otherwise return plain text.
+pub fn style_stdout<F>(msg: &str, style: F) -> String
+where
+    F: FnOnce(&str) -> String,
+{
+    if color_stdout() {
+        style(msg)
+    } else {
+        msg.to_string()
+    }
+}
