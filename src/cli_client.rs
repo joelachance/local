@@ -36,35 +36,57 @@ pub struct QueryArgs {
     pub raw: bool,
 }
 
+/// Shared HTTP client: per-request timeouts (`RequestBuilder::timeout`) so one policy applies everywhere.
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()
         .context("failed to build HTTP client")
 }
 
-/// Short timeout for /health so we don't wait 120s when something on the port is blocking (e.g. old server).
-fn health_check_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("failed to build HTTP client")
-}
+const REQ_TIMEOUT_DEFAULT: Duration = Duration::from_secs(120);
+const REQ_TIMEOUT_HEALTH: Duration = Duration::from_secs(5);
+const REQ_TIMEOUT_INDEX: Duration = Duration::from_secs(600);
 
-/// Client with long timeout for /index (copy + enqueue can be slow for iCloud/FileProvider).
-fn index_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .context("failed to build HTTP client")
+pub async fn doctor(cfg: &ServerConfig) -> Result<Value> {
+    let exe = std::env::current_exe().ok();
+    let mut out = json!({
+        "binary": exe.as_ref().map(|p| p.display().to_string()),
+        "config_path": crate::config::config_path().display().to_string(),
+        "config_exists": crate::config::config_path().exists(),
+        "server_url": cfg.base_url(),
+        "server_reachable": false,
+    });
+    if server_is_up(cfg).await {
+        out["server_reachable"] = json!(true);
+        let client = http_client()?;
+        let url = format!("{}/health", cfg.base_url());
+        match client.get(url).timeout(REQ_TIMEOUT_HEALTH).send().await {
+            Ok(resp) => {
+                out["health_status"] = json!(resp.status().as_u16());
+                if let Ok(body) = resp.text().await {
+                    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        out["health"] = v;
+                    } else {
+                        out["health_raw"] = json!(body);
+                    }
+                }
+            }
+            Err(e) => {
+                out["health_error"] = json!(e.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 async fn server_is_up(cfg: &ServerConfig) -> bool {
-    let Ok(client) = health_check_client() else {
+    let Ok(client) = http_client() else {
         return false;
     };
     let url = format!("{}/health", cfg.base_url());
-    match client.get(url).send().await {
+    match client.get(url).timeout(REQ_TIMEOUT_HEALTH).send().await {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
@@ -111,7 +133,7 @@ pub async fn status(cfg: &ServerConfig, dir: Option<&str>) -> Result<Value> {
     if let Some(d) = dir {
         url.push_str(&format!("?path={}", d));
     }
-    let resp = client.get(url).send().await?;
+    let resp = client.get(url).timeout(REQ_TIMEOUT_DEFAULT).send().await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
@@ -371,10 +393,15 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
 }
 
 pub async fn remove(cfg: &ServerConfig, path: &str) -> Result<Value> {
-    let client = index_http_client()?;
+    let client = http_client()?;
     let url = format!("{}/remove", cfg.base_url());
     let body = json!({ "path": path });
-    let resp = client.post(url).json(&body).send().await?;
+    let resp = client
+        .post(url)
+        .json(&body)
+        .timeout(REQ_TIMEOUT_INDEX)
+        .send()
+        .await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
@@ -400,7 +427,13 @@ pub async fn query(cfg: &ServerConfig, args: &QueryArgs, pack: Option<&str>) -> 
     if let Some(p) = pack {
         body["pack"] = json!(p);
     }
-    let resp = match client.post(url).json(&body).send().await {
+    let resp = match client
+        .post(url)
+        .json(&body)
+        .timeout(REQ_TIMEOUT_DEFAULT)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string().to_lowercase();
@@ -442,6 +475,7 @@ pub async fn publish(
     let resp = client
         .post(url)
         .json(&body)
+        .timeout(REQ_TIMEOUT_DEFAULT)
         .send()
         .await?;
     let status = resp.status();
@@ -465,7 +499,12 @@ pub async fn publish(
 pub async fn add(cfg: &ServerConfig, body: &serde_json::Value) -> Result<Value> {
     let client = http_client()?;
     let url = format!("{}/add", cfg.base_url());
-    let resp = client.post(url).json(body).send().await?;
+    let resp = client
+        .post(url)
+        .json(body)
+        .timeout(REQ_TIMEOUT_DEFAULT)
+        .send()
+        .await?;
     let status = resp.status();
     let resp_body = resp.text().await?;
     if !status.is_success() {
