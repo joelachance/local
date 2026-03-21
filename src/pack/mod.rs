@@ -251,7 +251,8 @@ pub fn resolve_source_roots(pack_dir: &Path, manifest: &Manifest) -> Vec<PathBuf
         .collect()
 }
 
-/// Memkit artifacts to remove when scrubbing. Covers both .memkit layout and legacy root layout.
+/// Memkit artifacts to remove when scrubbing. Covers both `.memkit` layout and legacy root layout.
+/// Includes a legacy on-disk vector directory name kept for scrubbing old trees.
 const MEMKIT_ARTIFACTS: &[&str] = &[
     ".memkit",
     "manifest.json",
@@ -263,8 +264,7 @@ const MEMKIT_ARTIFACTS: &[&str] = &[
     "ontology",
 ];
 
-/// Scrubs the memory pack from a directory. Removes .memkit, lancedb, manifest.json,
-/// and any other files that support memkit.
+/// Scrubs the memory pack from a directory. Removes `.memkit`, manifest, legacy index dirs, etc.
 pub fn scrub_pack_from_dir(dir: &Path) -> Result<()> {
     let mut removed_any = false;
     for name in MEMKIT_ARTIFACTS {
@@ -280,7 +280,7 @@ pub fn scrub_pack_from_dir(dir: &Path) -> Result<()> {
     }
     if !removed_any {
         bail!(
-            "not a memory pack: {} (no .memkit, manifest.json, lancedb, or other memkit artifacts)",
+            "not a memory pack: {} (no .memkit, manifest.json, or other memkit artifacts)",
             dir.display()
         );
     }

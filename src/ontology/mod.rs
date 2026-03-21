@@ -1,9 +1,7 @@
 // ONTOLOGY MODULE - INTERNAL USE ONLY
 //
-// This module provides entity/relation extraction for the indexer. It is used by
-// run_index() to populate the Falkor graph with Chunk->Entity and Entity->Entity
-// edges. There is no CLI or HTTP surface for ontology—it is purely an internal
-// pipeline step. Do not add ontology list/show/export commands or /ontology/* routes.
+// Entity/relation extraction for the indexer (Helix graph edges). No CLI or HTTP
+// surface for ontology—internal pipeline only.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -15,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::types::GraphRelation;
-use crate::ontology_candle::CandleOntologyProvider;
+#[cfg(feature = "llama-embedded")]
 use crate::ontology_llama::LlamaOntologyProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,15 +64,14 @@ pub trait OntologyProvider {
 pub enum OntologyProviderKind {
     Llama,
     Rules,
-    Candle,
 }
 
 impl OntologyProviderKind {
     fn from_str_value(value: &str) -> Self {
         match value.to_ascii_lowercase().as_str() {
             "rules" => Self::Rules,
-            "candle" => Self::Candle,
-            _ => Self::Llama,
+            "llama" => Self::Llama,
+            _ => Self::Rules,
         }
     }
 
@@ -82,7 +79,7 @@ impl OntologyProviderKind {
         Self::from_str_value(
             &std::env::var("MEMKIT_LLM_PROVIDER")
                 .or_else(|_| std::env::var("MEMKIT_ONTOLOGY_PROVIDER"))
-                .unwrap_or_else(|_| "llama".to_string()),
+                .unwrap_or_else(|_| "rules".to_string()),
         )
     }
 }
@@ -192,17 +189,26 @@ impl OntologyEngine {
         };
         let provider: Box<dyn OntologyProvider + Send> = match config.provider {
             OntologyProviderKind::Rules => Box::new(RuleOntologyProvider),
-            OntologyProviderKind::Candle => Box::new(CandleOntologyProvider::new(config.clone())),
             OntologyProviderKind::Llama => {
-                match LlamaOntologyProvider::new(config.clone()) {
-                    Ok(p) => Box::new(p),
-                    Err(err) => {
-                        crate::term::warn(format!(
-                            "warning: failed to initialize llama ontology provider ({}), using rules fallback",
-                            err
-                        ));
-                        Box::new(RuleOntologyProvider)
+                #[cfg(feature = "llama-embedded")]
+                {
+                    match LlamaOntologyProvider::new(config.clone()) {
+                        Ok(p) => Box::new(p),
+                        Err(err) => {
+                            crate::term::warn(format!(
+                                "warning: failed to initialize llama ontology provider ({}), using rules fallback",
+                                err
+                            ));
+                            Box::new(RuleOntologyProvider)
+                        }
                     }
+                }
+                #[cfg(not(feature = "llama-embedded"))]
+                {
+                    crate::term::warn(
+                        "warning: MEMKIT_LLM_PROVIDER=llama requires building with --features llama-embedded; using rules",
+                    );
+                    Box::new(RuleOntologyProvider)
                 }
             }
         };
@@ -403,8 +409,8 @@ mod tests {
             OntologyProviderKind::Rules
         );
         assert_eq!(
-            OntologyProviderKind::from_str_value("candle"),
-            OntologyProviderKind::Candle
+            OntologyProviderKind::from_str_value("unknown"),
+            OntologyProviderKind::Rules
         );
     }
 
@@ -421,7 +427,7 @@ mod tests {
         let out = engine
             .write_artifact(
                 "/tmp/demo-source",
-                &["Rust uses LanceDB".to_string()],
+                &["Rust memory pack chunk".to_string()],
                 &["hash1".to_string()],
             )
             .expect("artifact should be written");

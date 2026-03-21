@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn parses_and_normalizes_llama_json() {
-        let raw = r#"prefix {"entities":["Rust","LanceDB","FalkorDB"],"relations":[{"source":"Rust","relation":"uses","target":"LanceDB"}],"confidence":0.9} suffix"#;
+        let raw = r#"prefix {"entities":["Rust","Helix","Graph"],"relations":[{"source":"Rust","relation":"uses","target":"Helix"}],"confidence":0.9} suffix"#;
         let out = parse_llama_json(raw, 2).expect("json should parse");
         assert_eq!(out.entities.len(), 2);
         assert_eq!(out.entities[0], "rust");

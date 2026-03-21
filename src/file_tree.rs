@@ -8,7 +8,7 @@ fn is_memkit_internal(path: &str) -> bool {
         || p.ends_with("manifest.json")
         || p.ends_with("index.json")
         || p.ends_with("file_state.json")
-        || p.contains("/lancedb/")
+        || p.contains("/lancedb/") // legacy on-disk vector layout
         || p.ends_with(".lance")
 }
 
