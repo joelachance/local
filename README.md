@@ -47,7 +47,7 @@ mk doctor
 - `mk stop [--port]` — Stop background server on the configured port.
 - `mk schema [--format json|json-schema] [command]` — Introspect memkit or JSON Schema for agent inputs.
 
-**Agents:** use a single JSON object with `mk -j '{...}'` or `mk --json` (see [CONTEXT.md](CONTEXT.md)). Global flags: `--output json`, `--dry-run`.
+**Agents:** use a single JSON object with `mk -j '{...}'` or `mk --json` (see [CONTEXT.md](CONTEXT.md)). Global flags: `--output json`, `--dry-run`, `--version` / `-V`. Set `NO_COLOR=1` to disable ANSI colors in terminal output.
 
 ## Storage backend
 

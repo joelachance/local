@@ -4,6 +4,9 @@ use std::io::IsTerminal;
 
 use owo_colors::OwoColorize;
 
+/// Crate / CLI version (from Cargo.toml).
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Returns true if we should use colors on stdout (TTY and NO_COLOR not set).
 pub fn color_stdout() -> bool {
     !env::var("NO_COLOR").is_ok() && std::io::stdout().is_terminal()
@@ -24,6 +27,16 @@ pub fn warn(msg: impl Display) {
     }
 }
 
+/// Prints an error to stderr with a consistent prefix (red when stderr is a TTY).
+pub fn error(msg: impl Display) {
+    let s = msg.to_string();
+    if color_stderr() {
+        eprintln!("{} {}", "Error:".red().bold(), s);
+    } else {
+        eprintln!("Error: {}", s);
+    }
+}
+
 /// Apply stdout style when colors are enabled; otherwise return plain text.
 pub fn style_stdout<F>(msg: &str, style: F) -> String
 where
@@ -34,4 +47,108 @@ where
     } else {
         msg.to_string()
     }
+}
+
+// --- Theme helpers (stdout): roles for labels, data, state ---
+
+/// Main title line (e.g. help header).
+pub fn title_app(color: bool) -> String {
+    if color {
+        "memkit CLI".bold().cyan().to_string()
+    } else {
+        "memkit CLI".to_string()
+    }
+}
+
+/// Section heading (doctor, models).
+pub fn section_title(color: bool, s: &str) -> String {
+    if color {
+        s.bold().cyan().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Binary name accent (`mk`).
+pub fn mk_binary(color: bool) -> String {
+    if color {
+        "mk".cyan().to_string()
+    } else {
+        "mk".to_string()
+    }
+}
+
+/// Subcommand or keyword emphasis (bold).
+pub fn bold_word(color: bool, s: &str) -> String {
+    if color {
+        s.bold().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Secondary / options / filler text.
+pub fn dimmed_word(color: bool, s: &str) -> String {
+    if color {
+        s.dimmed().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Metrics, counts, host:port (cyan).
+pub fn data_num(color: bool, s: impl Display) -> String {
+    let t = s.to_string();
+    if color {
+        t.cyan().to_string()
+    } else {
+        t
+    }
+}
+
+pub fn success_words(color: bool, s: &str) -> String {
+    if color {
+        s.green().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+pub fn warn_words(color: bool, s: &str) -> String {
+    if color {
+        s.yellow().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+pub fn danger_words(color: bool, s: &str) -> String {
+    if color {
+        s.red().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Path + success state (bold green line prefix).
+pub fn bold_green(color: bool, s: &str) -> String {
+    if color {
+        s.bold().green().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Path + warning state (bold yellow).
+pub fn bold_yellow(color: bool, s: &str) -> String {
+    if color {
+        s.bold().yellow().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// `sync: local only` (dimmed).
+pub fn sync_local_only_label(color: bool) -> String {
+    dimmed_word(color, "sync: local only")
 }

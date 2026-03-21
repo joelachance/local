@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 
 use crate::term;
@@ -163,44 +162,70 @@ pub fn print_status(data: &Value) {
     let last_job_error = last_job.and_then(|j| j.get("error")).and_then(Value::as_str);
     let last_job_id = last_job.and_then(|j| j.get("id")).and_then(Value::as_str);
 
-    if term::color_stdout() {
+    let c = term::color_stdout();
+    if c {
         if pending_removal {
-            println!("{} {}", pack_path.bold(), "removing...".yellow());
+            println!(
+                "{} {}",
+                term::bold_word(c, pack_path),
+                term::warn_words(c, "removing...")
+            );
         } else if pending_add {
             let id = active_job_id.unwrap_or("?");
-            println!("{} {} {}", pack_path.bold(), id.dimmed(), "...pending".yellow());
+            println!(
+                "{} {} {}",
+                term::bold_word(c, pack_path),
+                term::dimmed_word(c, id),
+                term::warn_words(c, "...pending")
+            );
         } else if active_job {
             let id = active_job_id.unwrap_or("?");
-            println!("{} {} {}", pack_path.bold(), id.dimmed(), "...pending".yellow());
+            println!(
+                "{} {} {}",
+                term::bold_word(c, pack_path),
+                term::dimmed_word(c, id),
+                term::warn_words(c, "...pending")
+            );
         } else if indexed {
-            println!("{} successfully indexed", pack_path.bold().green());
+            println!(
+                "{} successfully indexed",
+                term::bold_green(c, pack_path)
+            );
         } else {
-            println!("{} not indexed", pack_path.bold().yellow());
+            println!("{} not indexed", term::bold_yellow(c, pack_path));
         }
-        println!("location: [local] [cloud]");
+        println!("{}", term::sync_local_only_label(c));
         if !file_tree.is_empty() {
             println!();
-            println!("{}", file_tree.dimmed());
+            println!("{}", term::dimmed_word(c, file_tree));
         }
         println!();
         println!(
             "{} vector entries",
-            vector_count.to_string().cyan()
+            term::data_num(c, vector_count)
         );
         println!(
             "{} entities, {} relationships",
-            entities.to_string().cyan(),
-            relationships.to_string().cyan()
+            term::data_num(c, entities),
+            term::data_num(c, relationships)
         );
         for q in queued_jobs {
             if let Some(id) = q.get("id").and_then(Value::as_str) {
-                println!("  {} {}", id.dimmed(), "...pending".yellow());
+                println!(
+                    "  {} {}",
+                    term::dimmed_word(c, id),
+                    term::warn_words(c, "...pending")
+                );
             }
         }
         if !indexed && last_job_failed {
             if let Some(err) = last_job_error {
                 let id = last_job_id.unwrap_or("job");
-                println!("  {} {}", id.dimmed(), format!("failed: {}", err).red());
+                println!(
+                    "  {} {}",
+                    term::dimmed_word(c, id),
+                    term::danger_words(c, &format!("failed: {}", err))
+                );
             }
         }
     } else {
@@ -214,7 +239,7 @@ pub fn print_status(data: &Value) {
         } else {
             println!("{} not indexed", pack_path);
         }
-        println!("location: [local] [cloud]");
+        println!("sync: local only");
         if !file_tree.is_empty() {
             println!();
             println!("{}", file_tree);
@@ -249,18 +274,27 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
             let sources = data.get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
             let active_job = data.get("jobs").and_then(|j| j.get("active"));
 
-            if term::color_stdout() {
-                println!("{} [local] [cloud]", pack_path.bold());
+            let c = term::color_stdout();
+            if c {
+                println!(
+                    "{}  {}",
+                    term::bold_word(c, pack_path),
+                    term::sync_local_only_label(c)
+                );
                 for s in sources.iter().take(10) {
                     let path = s.get("root_path").and_then(Value::as_str).unwrap_or("?");
-                    println!("  {}", path.dimmed());
+                    println!("  {}", term::dimmed_word(c, path));
                 }
                 if let Some(obj) = active_job.and_then(Value::as_object) {
                     let job_id = obj.get("id").and_then(Value::as_str).unwrap_or("?");
-                    println!("  {} {}", job_id.dimmed(), "...pending".yellow());
+                    println!(
+                        "  {} {}",
+                        term::dimmed_word(c, job_id),
+                        term::warn_words(c, "...pending")
+                    );
                 }
             } else {
-                println!("{} [local] [cloud]", pack_path);
+                println!("{}  sync: local only", pack_path);
                 for s in sources.iter().take(10) {
                     let path = s.get("root_path").and_then(Value::as_str).unwrap_or("?");
                     println!("  {}", path);
@@ -275,6 +309,7 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
     }
 
     if !output_json {
+        let c = term::color_stdout();
         let home_canon = dirs::home_dir().and_then(|h| h.canonicalize().ok());
         let default_path = reg.default_path.as_deref();
         for p in &reg.packs {
@@ -292,30 +327,36 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
             } else {
                 (path_display, "")
             };
-            if term::color_stdout() {
-                let cloud = if p.cloud { format!("{}", "[cloud]".cyan()) } else { format!("{}", "cloud".dimmed()) };
+            if c {
+                let cloud = if p.cloud {
+                    term::data_num(c, "[cloud]")
+                } else {
+                    term::dimmed_word(c, "cloud")
+                };
                 if path_part.is_empty() {
                     println!(
-                        "{} [local] {} {}",
-                        lead.bold(),
+                        "{} {} {} {}",
+                        term::bold_word(c, lead),
+                        term::dimmed_word(c, "local"),
                         cloud,
-                        default_marker.dimmed()
+                        term::dimmed_word(c, default_marker)
                     );
                 } else {
                     println!(
-                        "{}  {} [local] {} {}",
-                        lead.bold(),
-                        path_part.dimmed(),
+                        "{} {} {} {} {}",
+                        term::bold_word(c, lead),
+                        term::dimmed_word(c, path_part),
+                        term::dimmed_word(c, "local"),
                         cloud,
-                        default_marker.dimmed()
+                        term::dimmed_word(c, default_marker)
                     );
                 }
             } else {
                 let cloud = if p.cloud { "[cloud]" } else { "cloud" };
                 if path_part.is_empty() {
-                    println!("{} [local] {} {}", lead, cloud, default_marker);
+                    println!("{} local {} {}", lead, cloud, default_marker);
                 } else {
-                    println!("{}  {} [local] {} {}", lead, path_part, cloud, default_marker);
+                    println!("{}  {} local {} {}", lead, path_part, cloud, default_marker);
                 }
             }
             // Show sources and pending job for this pack (requires server).
@@ -323,8 +364,8 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
                 let sources = data.get("sources").and_then(Value::as_array).map_or([].as_ref(), |v| v.as_slice());
                 for s in sources.iter().take(20) {
                     let path = s.get("root_path").and_then(Value::as_str).unwrap_or("?");
-                    if term::color_stdout() {
-                        println!("  {}", path.dimmed());
+                    if c {
+                        println!("  {}", term::dimmed_word(c, path));
                     } else {
                         println!("  {}", path);
                     }
@@ -332,8 +373,12 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
                 let active_job = data.get("jobs").and_then(|j| j.get("active"));
                 if let Some(obj) = active_job.and_then(Value::as_object) {
                     let job_id = obj.get("id").and_then(Value::as_str).unwrap_or("?");
-                    if term::color_stdout() {
-                        println!("  {} {}", job_id.dimmed(), "...pending".yellow());
+                    if c {
+                        println!(
+                            "  {} {}",
+                            term::dimmed_word(c, job_id),
+                            term::warn_words(c, "...pending")
+                        );
                     } else {
                         println!("  {} ...pending", job_id);
                     }
@@ -341,8 +386,12 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
                 let queued_jobs = data.get("jobs").and_then(|j| j.get("queued_jobs")).and_then(Value::as_array).map(|a| a.as_slice()).unwrap_or(&[]);
                 for q in queued_jobs {
                     if let Some(id) = q.get("id").and_then(Value::as_str) {
-                        if term::color_stdout() {
-                            println!("  {} {}", id.dimmed(), "...pending".yellow());
+                        if c {
+                            println!(
+                                "  {} {}",
+                                term::dimmed_word(c, id),
+                                term::warn_words(c, "...pending")
+                            );
                         } else {
                             println!("  {} ...pending", id);
                         }
@@ -375,13 +424,13 @@ pub async fn list(cfg: &ServerConfig, output_json: bool) -> Result<Value> {
                 } else {
                     format!("not indexed ({})", counts_suffix)
                 };
-                if term::color_stdout() {
+                if c {
                     if active_obj.is_some() {
-                        println!("  {}", status_line.yellow());
+                        println!("  {}", term::warn_words(c, &status_line));
                     } else if indexed {
-                        println!("  {}", status_line.green());
+                        println!("  {}", term::success_words(c, &status_line));
                     } else {
-                        println!("  {}", status_line.dimmed());
+                        println!("  {}", term::dimmed_word(c, &status_line));
                     }
                 } else {
                     println!("  {}", status_line);
@@ -486,11 +535,8 @@ pub async fn publish(
     let out: Value = serde_json::from_str(&resp_body)?;
     if !output_json {
         if let Some(uri) = out.get("uri").and_then(Value::as_str) {
-            println!(
-                "{} {}",
-                term::style_stdout("Published to", |s| s.green().to_string()),
-                uri
-            );
+            let c = term::color_stdout();
+            println!("{} {}", term::success_words(c, "Published to"), uri);
         }
     }
     Ok(out)
@@ -523,18 +569,19 @@ pub async fn add(cfg: &ServerConfig, body: &serde_json::Value) -> Result<Value> 
 
 /// Print add result: "Added N chunks." when synchronous success, or "Adding (job-N)..." when async job.
 pub fn print_add_started(data: &Value, pack_path: &str) {
+    let c = term::color_stdout();
     if let Some(n) = data.get("result").and_then(|r| r.get("chunks_added")).and_then(Value::as_u64) {
         println!(
             "{} {}",
-            term::style_stdout("Added", |s| s.green().to_string()),
-            term::style_stdout(&format!("{} chunks.", n), |s| s.cyan().to_string())
+            term::success_words(c, "Added"),
+            term::data_num(c, &format!("{} chunks.", n))
         );
         return;
     }
     if let Some(job_id) = data.get("job").and_then(|j| j.get("id")).and_then(Value::as_str) {
         println!(
             "{} ({}). Run 'mk status {}' to check progress.",
-            term::style_stdout("Adding", |s| s.green().to_string()),
+            term::success_words(c, "Adding"),
             job_id,
             pack_path
         );

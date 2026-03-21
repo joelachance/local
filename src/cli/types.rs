@@ -65,5 +65,7 @@ pub enum CliCommand {
     Stop {
         port: Option<u16>,
     },
+    /// Print version and exit.
+    Version,
     Help,
 }

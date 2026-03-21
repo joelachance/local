@@ -406,6 +406,7 @@ fn cli_command_from_json(cmd: &str, j: &serde_json::Value) -> Result<CliCommand>
         "use" => cli_use_from_json(j),
         "models" => Ok(CliCommand::Models),
         "doctor" => Ok(CliCommand::Doctor),
+        "version" => Ok(CliCommand::Version),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(anyhow!("unknown command: {}. run `mk help` for usage", other)),
     }
@@ -414,6 +415,13 @@ fn cli_command_from_json(cmd: &str, j: &serde_json::Value) -> Result<CliCommand>
 fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
     if args.is_empty() {
         return Ok(CliCommand::Help);
+    }
+
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "--version" | "-V" | "version" => return Ok(CliCommand::Version),
+            _ => {}
+        }
     }
 
     // Agent mode: mk --json | -j '<one JSON object with "command">'
@@ -674,47 +682,66 @@ fn run_use(spec: &UseSpec) -> Result<()> {
     Ok(())
 }
 
+/// `tail` includes any leading spaces after the subcommand (e.g. ` " <args>…"` or ` "   (note)"`).
+fn print_help_cmd_line(c: bool, sub: &str, tail: &str) {
+    println!(
+        "  {} {}{}",
+        crate::term::mk_binary(c),
+        crate::term::bold_word(c, sub),
+        crate::term::dimmed_word(c, tail)
+    );
+}
+
 fn print_help() {
-    let color = crate::term::color_stdout();
-    let title = if color {
-        "memkit CLI".bold().cyan().to_string()
-    } else {
-        "memkit CLI".to_string()
-    };
-    println!("{}", title);
+    let c = crate::term::color_stdout();
+    println!("{}", crate::term::title_app(c));
+    println!(
+        "{}",
+        crate::term::dimmed_word(c, &format!("version {}", crate::term::PKG_VERSION))
+    );
     println!();
-    let usage = if color {
-        "Usage:".dimmed().to_string()
-    } else {
-        "Usage:".to_string()
-    };
-    println!("{}", usage);
-    println!("  Agent JSON: mk -j '{{...}}'  (same as --json; object must include \"command\")");
-    println!("  Global flags: [--output json|text] [--dry-run]");
+    println!("{}", crate::term::dimmed_word(c, "Usage:"));
+    println!(
+        "  {} {} {}{}",
+        crate::term::dimmed_word(c, "Agent JSON:"),
+        crate::term::mk_binary(c),
+        crate::term::bold_word(c, "-j"),
+        crate::term::dimmed_word(c, " '<JSON>'  (same as --json / --mjson; object must include \"command\")")
+    );
+    println!(
+        "  {}",
+        crate::term::dimmed_word(c, "Global flags: [--output json|text] [--dry-run] [--version | -V]")
+    );
     println!();
-    let commands = [
-        "  mk --json | -j '{\"command\":\"<cmd>\", ...}'   (single JSON object; agent entry point)",
-        "  mk add <path-or-url> [--pack <name-or-path>]",
-        "  mk remove [dir]",
-        "  mk status [dir]   (omit dir to list all registered packs)",
-        "  mk query <text> [--top-k N] [--no-rerank] [--pack <name-or-path>] [--raw]",
-        "  mk publish [--pack <name-or-path>] [--destination s3://bucket/prefix]",
-        "  mk use   (show default pack and model)",
-        "  mk use pack [name-or-path]   (show or set default pack)",
-        "  mk use model [model-id]   (show or set default model)",
-        "  mk models  (list supported model IDs)",
-        "  mk doctor  (config path + server /health reachability)",
-        "  mk serve [--pack <path>] [--host H] [--port P] [--foreground]",
-        "  mk stop [--port P]",
-        "  mk schema [--format json|json-schema] [command]",
-    ];
-    for cmd in commands {
-        if color {
-            println!("{}", cmd.cyan());
-        } else {
-            println!("{}", cmd);
-        }
-    }
+    print_help_cmd_line(c, "add", " <path-or-url> [--pack <name-or-path>]");
+    print_help_cmd_line(c, "remove", " [dir]");
+    print_help_cmd_line(
+        c,
+        "status",
+        " [dir]   (omit dir to list all registered packs)",
+    );
+    print_help_cmd_line(
+        c,
+        "query",
+        " <text> [--top-k N] [--no-rerank] [--pack <name-or-path>] [--raw]",
+    );
+    print_help_cmd_line(
+        c,
+        "publish",
+        " [--pack <name-or-path>] [--destination s3://bucket/prefix]",
+    );
+    print_help_cmd_line(c, "use", "   (show default pack and model)");
+    print_help_cmd_line(c, "use pack", " [name-or-path]   (show or set default pack)");
+    print_help_cmd_line(c, "use model", " [model-id]   (show or set default model)");
+    print_help_cmd_line(c, "models", "   (list supported model IDs)");
+    print_help_cmd_line(c, "doctor", "   (config path + server /health reachability)");
+    print_help_cmd_line(c, "serve", " [--pack <path>] [--host H] [--port P] [--foreground]");
+    print_help_cmd_line(c, "stop", " [--port P]");
+    print_help_cmd_line(c, "schema", " [--format json|json-schema] [command]");
+}
+
+fn print_version() {
+    println!("memkit {}", crate::term::PKG_VERSION);
 }
 
 /// If dotenvy failed to set MEMKIT_GOOGLE_SERVICE_ACCOUNT_JSON (e.g. value has newlines), try loading
@@ -809,7 +836,14 @@ fn load_memkit_google_json_from_dotenv_fallback() {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        crate::term::error(&e);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     dotenvy::dotenv().ok();
     load_memkit_google_json_from_dotenv_fallback();
     let args: Vec<String> = env::args().skip(1).collect();
@@ -823,6 +857,7 @@ async fn main() -> Result<()> {
     }
 
     match parse_cli_command(&args)? {
+        CliCommand::Version => print_version(),
         CliCommand::Help => print_help(),
         CliCommand::Schema { command, format } => {
             crate::cli::schema::print_schema(command.as_deref(), format)?;
@@ -943,21 +978,40 @@ async fn main() -> Result<()> {
                         });
                         println!("{}", serde_json::to_string_pretty(&out)?);
                     } else {
-                        if crate::term::color_stdout() {
-                            println!("{}", "Models".bold().cyan());
+                        let c = crate::term::color_stdout();
+                        if c {
+                            println!("{}", crate::term::section_title(c, "Models"));
                             println!();
                             if let Some(ref m) = cfg.model {
-                                println!("  {} {}", "Current:".bold(), m);
+                                println!(
+                                    "  {} {}",
+                                    crate::term::bold_word(c, "Current:"),
+                                    m
+                                );
                             } else {
-                                println!("  {} (none set)", "Current:".bold());
+                                println!(
+                                    "  {} {}",
+                                    crate::term::bold_word(c, "Current:"),
+                                    crate::term::dimmed_word(c, "(none set)")
+                                );
                             }
                             println!();
-                            println!("  {}", "Supported:".bold());
+                            println!("  {}", crate::term::bold_word(c, "Supported:"));
                             for (id, desc) in &supported {
-                                println!("    {}  {}", id.cyan(), desc.dimmed());
+                                println!(
+                                    "    {}  {}",
+                                    crate::term::data_num(c, id),
+                                    crate::term::dimmed_word(c, desc)
+                                );
                             }
                             println!();
-                            println!("  {}", "Run 'mk use model <id>' to set a default model.".dimmed());
+                            println!(
+                                "  {}",
+                                crate::term::dimmed_word(
+                                    c,
+                                    "Run 'mk use model <id>' to set a default model."
+                                )
+                            );
                         } else {
                             if let Some(ref m) = cfg.model {
                                 println!("Current: {}", m);
@@ -980,6 +1034,7 @@ async fn main() -> Result<()> {
             let commands_need_server = !matches!(
                 cmd,
                 CliCommand::Help
+                    | CliCommand::Version
                     | CliCommand::Schema { .. }
                     | CliCommand::Use(_)
                     | CliCommand::Models
@@ -1119,18 +1174,23 @@ async fn main() -> Result<()> {
                     if ctx.output_format == OutputFormat::Json {
                         println!("{}", serde_json::to_string_pretty(&data)?);
                     } else {
+                        let c = crate::term::color_stdout();
+                        println!("{}", crate::term::section_title(c, "memkit doctor"));
                         println!(
-                            "{}",
-                            crate::term::style_stdout("memkit doctor", |s| s.bold().cyan().to_string())
+                            "{} {}",
+                            crate::term::bold_word(c, "config:"),
+                            data["config_path"].as_str().unwrap_or("")
                         );
-                        println!("config: {}", data["config_path"].as_str().unwrap_or(""));
+                        let reachable = data["server_reachable"].as_bool().unwrap_or(false);
+                        let state = if reachable {
+                            crate::term::success_words(c, "reachable")
+                        } else {
+                            crate::term::danger_words(c, "not reachable")
+                        };
                         println!(
-                            "server {} ({})",
-                            if data["server_reachable"].as_bool().unwrap_or(false) {
-                                "reachable"
-                            } else {
-                                "not reachable"
-                            },
+                            "{} {} ({})",
+                            crate::term::bold_word(c, "server:"),
+                            state,
                             data["server_url"].as_str().unwrap_or("")
                         );
                     }
@@ -1234,7 +1294,13 @@ async fn main() -> Result<()> {
                         Ok(CommandOut::Output(out))
                     }
                 }
-                CliCommand::Help | CliCommand::Schema { .. } | CliCommand::Use(_) | CliCommand::Models | CliCommand::Serve { .. } | CliCommand::Stop { .. } => unreachable!(),
+                CliCommand::Help
+                | CliCommand::Version
+                | CliCommand::Schema { .. }
+                | CliCommand::Use(_)
+                | CliCommand::Models
+                | CliCommand::Serve { .. }
+                | CliCommand::Stop { .. } => unreachable!(),
             };
             let command_out = result?;
             if let CommandOut::Output(out) = command_out {
@@ -1267,11 +1333,11 @@ pub(crate) async fn serve_with_startup(packs: Vec<PathBuf>, host: String, port: 
         };
         println!(
             "{} {} {} {}:{}",
-            "serving pack".cyan(),
-            pack_display.bold(),
-            "on".cyan(),
-            host.cyan(),
-            port.to_string().cyan()
+            crate::term::dimmed_word(color, "serving pack"),
+            crate::term::bold_word(color, &pack_display),
+            crate::term::dimmed_word(color, "on"),
+            crate::term::data_num(color, &host),
+            crate::term::data_num(color, &port.to_string())
         );
     } else {
         if packs.len() == 1 {
